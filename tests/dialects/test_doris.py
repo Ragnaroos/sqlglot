@@ -1,9 +1,91 @@
-from sqlglot import ParseError, UnsupportedError, exp
+from sqlglot import ErrorLevel, ParseError, UnsupportedError, exp, parse_one
 from tests.dialects.test_dialect import Validator
 
 
 class TestDoris(Validator):
     dialect = "doris"
+
+    def test_array_constructor(self):
+        for source, expected in (
+            ("SELECT ARRAY[1, 2]", "SELECT ARRAY(1, 2)"),
+            ("SELECT ARRAY[1, NULL, 2, 1]", "SELECT ARRAY(1, NULL, 2, 1)"),
+            ("SELECT ARRAY[NULL]", "SELECT ARRAY(NULL)"),
+            ("SELECT ARRAY[]::INT[]", "SELECT CAST(ARRAY() AS ARRAY<INT>)"),
+            (
+                "SELECT ARRAY[[1, 2], [3, 4]]",
+                "SELECT ARRAY(ARRAY(1, 2), ARRAY(3, 4))",
+            ),
+            (
+                "SELECT ARRAY[1::BIGINT, NULL::BIGINT]",
+                "SELECT ARRAY(CAST(1 AS BIGINT), CAST(NULL AS BIGINT))",
+            ),
+            (
+                "SELECT ARRAY[1.25::DECIMAL(10, 2), NULL::DECIMAL(10, 2)]",
+                "SELECT ARRAY(CAST(1.25 AS DECIMAL(10, 2)), CAST(NULL AS DECIMAL(10, 2)))",
+            ),
+            (
+                "SELECT ARRAY['hello', 'world', '']",
+                "SELECT ARRAY('hello', 'world', '')",
+            ),
+            ("SELECT ARRAY[x, NULL] FROM t", "SELECT ARRAY(x, NULL) FROM t"),
+            ("SELECT ARRAY[(SELECT 1)]", "SELECT ARRAY((SELECT 1))"),
+            (
+                "SELECT ARRAY[(SELECT 1 WHERE FALSE)]",
+                "SELECT ARRAY((SELECT 1 WHERE FALSE))",
+            ),
+            (
+                "SELECT ARRAY[(SELECT 1), (SELECT 2)]",
+                "SELECT ARRAY((SELECT 1), (SELECT 2))",
+            ),
+            (
+                "SELECT any_value(v) FROM (VALUES (ARRAY['hello', 'world'])) AS v(v)",
+                "SELECT ANY_VALUE(v) FROM (SELECT ARRAY('hello', 'world') AS v) AS v",
+            ),
+        ):
+            with self.subTest(source):
+                self.assertEqual(
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    ),
+                    expected,
+                )
+                self.validate_identity(expected)
+                self.assertEqual(
+                    parse_one(expected, read="doris").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    ),
+                    expected,
+                )
+
+        for dialect, source in (
+            ("hive", "SELECT ARRAY(1, 2)"),
+            ("bigquery", "SELECT [1, 2]"),
+            ("clickhouse", "SELECT [1, 2]"),
+        ):
+            with self.subTest(dialect):
+                self.assertEqual(
+                    parse_one(source, read=dialect).sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    ),
+                    "SELECT ARRAY(1, 2)",
+                )
+
+        with self.assertRaises(UnsupportedError):
+            parse_one("SELECT ARRAY[1, 2]", read="postgres").sql(
+                "mysql", unsupported_level=ErrorLevel.RAISE
+            )
+
+    def test_array_query_constructor(self):
+        for source in (
+            "SELECT ARRAY(SELECT 1)",
+            "SELECT ARRAY((SELECT 1))",
+            "SELECT ARRAY(SELECT 1 UNION ALL SELECT 2)",
+        ):
+            with self.subTest(source):
+                with self.assertRaisesRegex(UnsupportedError, "ARRAY subquery constructors"):
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    )
 
     def test_doris(self):
         self.validate_all(

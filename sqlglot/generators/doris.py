@@ -23,6 +23,16 @@ def _lag_lead_sql(self, expression: exp.Lag | exp.Lead) -> str:
 
 
 class DorisGenerator(MySQLGenerator):
+    def array_sql(self, expression: exp.Array) -> str:
+        expressions = expression.expressions
+        if (
+            len(expressions) == 1
+            and isinstance(expressions[0], exp.Query)
+            and not expression.args.get("value_constructor")
+        ):
+            self.unsupported("Doris does not support ARRAY subquery constructors")
+        return self.func("ARRAY", *expressions)
+
     def match_sql(self, expression: exp.Match) -> str:
         kind = expression.text("kind")
         sql = self.binary(expression, f"MATCH_{kind}" if kind else "MATCH")
