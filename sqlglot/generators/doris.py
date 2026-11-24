@@ -23,6 +23,19 @@ def _lag_lead_sql(self, expression: exp.Lag | exp.Lead) -> str:
 
 
 class DorisGenerator(MySQLGenerator):
+    def arrayagg_sql(self, expression: exp.ArrayAgg) -> str:
+        context = expression.find_ancestor(exp.Window, exp.Filter, exp.WithinGroup, exp.Select)
+        if (
+            isinstance(context, (exp.Window, exp.Filter, exp.WithinGroup))
+            or isinstance(expression.this, exp.Order)
+            or expression.args.get("nulls_excluded")
+        ):
+            return self.func("COLLECT_LIST", expression.this)
+        aggregate = self.func("ARRAY_AGG", expression.this)
+        if expression.args.get("null_on_empty"):
+            return self.func("NULLIF", aggregate, self.func("ARRAY"))
+        return aggregate
+
     def array_sql(self, expression: exp.Array) -> str:
         expressions = expression.expressions
         if (
@@ -66,12 +79,11 @@ class DorisGenerator(MySQLGenerator):
     TIMESTAMP_FUNC_TYPES: t.ClassVar[set[exp.DType]] = set()
 
     TRANSFORMS = {
-        **MySQLGenerator.TRANSFORMS,
+        **{k: v for k, v in MySQLGenerator.TRANSFORMS.items() if k != exp.ArrayAgg},
         exp.AddMonths: rename_func("MONTHS_ADD"),
         exp.ApproxDistinct: approx_count_distinct_sql,
         exp.ArgMax: rename_func("MAX_BY"),
         exp.ArgMin: rename_func("MIN_BY"),
-        exp.ArrayAgg: rename_func("COLLECT_LIST"),
         exp.ArrayToString: rename_func("ARRAY_JOIN"),
         exp.ArrayUniqueAgg: rename_func("COLLECT_SET"),
         exp.CurrentDate: lambda self, _: self.func("CURRENT_DATE"),

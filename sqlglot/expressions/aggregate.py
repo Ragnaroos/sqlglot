@@ -75,7 +75,9 @@ class ArgMin(Expression, AggFunc):
 
 
 class ArrayAgg(Expression, AggFunc):
-    arg_types = {"this": True, "nulls_excluded": False}
+    """Array aggregation with an optional explicit SQL NULL contract for empty input."""
+
+    arg_types = {"this": True, "nulls_excluded": False, "null_on_empty": False}
 
 
 class ArrayConcatAgg(Expression, AggFunc):
