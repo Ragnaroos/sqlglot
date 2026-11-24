@@ -362,8 +362,29 @@ class DorisGenerator(MySQLGenerator):
         return self.func("ARRAY", *expressions)
 
     def _coerce_array_input(self, expression: exp.Expr, dtype: exp.DataType) -> exp.Expr:
-        literal = expression.unnest()
+        literal = expression
+        while isinstance(literal, exp.Paren):
+            literal = literal.this
         if dtype.is_type(exp.DType.FLOAT, exp.DType.DOUBLE):
+            if isinstance(literal, exp.Subquery):
+                query = literal.this
+                if (
+                    isinstance(query, exp.Select)
+                    and len(query.expressions) == 1
+                    and not any(value for key, value in query.args.items() if key != "expressions")
+                ):
+                    projection = query.expressions[0]
+                    value = self._coerce_array_input(projection.unalias(), dtype)
+                    if value != projection.unalias():
+                        result = literal.copy()
+                        if isinstance(projection, exp.Alias):
+                            projection = projection.copy()
+                            projection.set("this", value)
+                        else:
+                            projection = value
+                        result.this.set("expressions", [projection])
+                        return result
+                return expression.copy()
             if isinstance(literal, exp.Neg):
                 value = self._coerce_array_input(literal.this, dtype)
                 return exp.Neg(this=value) if value != literal.this else expression.copy()

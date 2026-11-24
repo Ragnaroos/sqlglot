@@ -984,8 +984,60 @@ class TestDoris(Validator):
                 "ARRAY(CAST(0.1 AS FLOAT))",
             )
         self.assertEqual(parse_one("0.1::REAL", read="postgres").sql("doris"), "CAST(0.1 AS FLOAT)")
-        for source in ("ARRAY[x::REAL]", "ARRAY[(SELECT 0.1::REAL)]", "ARRAY['NaN'::REAL]"):
+        for source in ("ARRAY[x::REAL]", "ARRAY['NaN'::REAL]"):
             self.assertNotIn("ARRAY_MAP", parse_one(source, read="postgres").sql("doris"))
+
+    def test_postgres_array_scalar_real_inputs(self):
+        exact = "CAST('0.100000001490116119384765625' AS DOUBLE)"
+        for source, expected in (
+            (
+                "ARRAY[(SELECT 0.1::REAL), 2::DOUBLE PRECISION]",
+                f"CAST(ARRAY((SELECT {exact}), CAST(2 AS DOUBLE)) AS ARRAY<DOUBLE>)",
+            ),
+            (
+                "ARRAY[(SELECT 0.1::REAL AS value)]",
+                f"ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY((SELECT {exact} AS `value`)))",
+            ),
+            (
+                "ARRAY[(SELECT -0.1::REAL)]",
+                f"ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY((SELECT -{exact})))",
+            ),
+            (
+                "ARRAY[(SELECT (SELECT 0.1::REAL))]",
+                f"ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY((SELECT (SELECT {exact}))))",
+            ),
+            (
+                "ARRAY[(SELECT 0.1::REAL)]::DOUBLE PRECISION[]",
+                f"CAST(CAST(ARRAY((SELECT {exact})) AS ARRAY<DOUBLE>) AS ARRAY<DOUBLE>)",
+            ),
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                self.assertEqual(tree.sql("doris", copy=False), expected)
+                self.assertEqual(tree, before)
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                self.validate_identity(expected)
+
+        # Do not move coercion through a table, row filter, set operation or aggregate.
+        for source in (
+            "ARRAY[(SELECT 0.1::REAL WHERE FALSE)]",
+            "ARRAY[(SELECT 0.1::REAL FROM t)]",
+            "ARRAY[(SELECT 0.1::REAL LIMIT 0)]",
+            "ARRAY[(SELECT 0.1::REAL UNION ALL SELECT 0.2::REAL)]",
+            "ARRAY[(SELECT SUM(x)::REAL FROM t)]",
+            "ARRAY[(SELECT NULL::REAL)]",
+            "ARRAY[(SELECT 0.5::REAL)]",
+        ):
+            with self.subTest(source):
+                self.assertNotIn(
+                    "0.100000001490116119384765625", parse_one(source, read="postgres").sql("doris")
+                )
+
+        self.assertEqual(
+            parse_one("(SELECT 0.1::REAL)", read="postgres").sql("doris"),
+            "(SELECT CAST(0.1 AS FLOAT))",
+        )
 
     def test_array_query_constructor(self):
         for source in (
