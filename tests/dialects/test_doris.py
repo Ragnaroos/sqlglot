@@ -1096,7 +1096,7 @@ class TestDoris(Validator):
             "ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(CAST('NaN' AS DOUBLE)))",
             read={"postgres": "ARRAY['NaN'::REAL]"},
         )
-        for value in ("nan(payload)", "nans", "infi", "Infinity!", "1e400"):
+        for value in ("nan(payload)", "nans", "infi", "Infinity!", "İnf", "ınf", "1e400"):
             with self.subTest(value):
                 with self.assertRaises(UnsupportedError):
                     parse_one(f"ARRAY[1::REAL, '{value}']", read="postgres").sql(

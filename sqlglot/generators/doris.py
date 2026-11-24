@@ -517,7 +517,7 @@ class DorisGenerator(MySQLGenerator):
         # Bound work before constructing the exact ratio for extreme exponents.
         if len(value) > 4096:
             return None
-        if re.fullmatch(r"[+-]?(?:nan|inf(?:inity)?)", value, re.IGNORECASE):
+        if re.fullmatch(r"[+-]?(?:nan|inf(?:inity)?)", value, re.IGNORECASE | re.ASCII):
             return (
                 "NaN"
                 if value.lstrip("+-").lower() == "nan"
