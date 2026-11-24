@@ -69,6 +69,48 @@ class DorisGenerator(MySQLGenerator):
         dialect="mysql",
     )
 
+    def regrcount_sql(self, expression: exp.RegrCount) -> str:
+        args = (expression.this, expression.expression)
+        context = expression.find_ancestor(exp.Window, exp.Filter, exp.WithinGroup, exp.Select)
+        supported = not isinstance(context, (exp.Window, exp.Filter, exp.WithinGroup))
+        for arg in args:
+            if arg is None:
+                supported = False
+                break
+            value = arg.unnest()
+            while type(value) is exp.Cast and value.to.is_type(*exp.DataType.NUMERIC_TYPES):
+                value = value.this.unnest()
+            if (
+                not isinstance(value, exp.Column)
+                and not value.is_number
+                and not (
+                    value.is_leaf()
+                    and not isinstance(value, exp.Func)
+                    and annotate_types(
+                        exp.Coalesce(this=value.copy(), expressions=[exp.Literal.number(1)]),
+                        dialect="postgres",
+                    ).is_type(exp.DType.INT)
+                )
+            ):
+                supported = False
+                break
+
+        if not supported:
+            self.unsupported(
+                "Doris REGR_COUNT requires two numeric columns or constants, optionally with "
+                "numeric CASTs, without DISTINCT, ORDER BY, FILTER or OVER"
+            )
+            return self.func("REGR_COUNT", *args)
+
+        return self.func(
+            "COUNT",
+            exp.If(
+                this=exp.and_(*(arg.copy().is_(exp.null()).not_() for arg in args)),
+                true=exp.Literal.number(1),
+                false=exp.null(),
+            ),
+        )
+
     def table_sql(self, expression: exp.Table, sep: str = " AS ") -> str:
         ancestor = expression.find_ancestor(exp.Update, exp.Delete, exp.Select)
         if not isinstance(ancestor, exp.Select):
