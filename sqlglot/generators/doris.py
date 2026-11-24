@@ -436,6 +436,41 @@ class DorisGenerator(MySQLGenerator):
                     unchanged = False
                 if not unchanged:
                     return exp.cast(exp.Literal.string(normalized), exp.DType.DOUBLE)
+            elif (
+                not isinstance(value, exp.Query)
+                and not value.is_string
+                and not value.is_number
+                and casts
+                and next((cast for cast in reversed(casts) if cast is not None), None)
+                == exp.DataType.build(exp.DType.DOUBLE)
+                and any(cast is not None and cast.is_type(exp.DType.FLOAT) for cast in casts)
+            ):
+                result = value.copy()
+                previous = None
+                for cast in reversed(casts):
+                    if cast is None:
+                        result = exp.Neg(this=result)
+                        continue
+                    if cast.is_type(exp.DType.FLOAT) and previous == exp.DType.DOUBLE:
+                        parameter = exp.to_identifier("_pg_real_input")
+                        result = exp.Bracket(
+                            this=exp.Anonymous(
+                                this="ARRAY_MAP",
+                                expressions=[
+                                    exp.Lambda(
+                                        this=exp.cast(parameter, exp.DType.FLOAT),
+                                        expressions=[parameter],
+                                    ),
+                                    exp.Array(expressions=[result]),
+                                ],
+                            ),
+                            expressions=[exp.Literal.number(1)],
+                            offset=self.dialect.INDEX_OFFSET,
+                        )
+                    else:
+                        result = exp.cast(result, cast.copy())
+                    previous = cast.this
+                return result
         if not literal.is_string or dtype.is_type(exp.DType.TEXT):
             return expression.copy()
 

@@ -1103,6 +1103,43 @@ class TestDoris(Validator):
                         "doris", unsupported_level=ErrorLevel.RAISE
                     )
 
+    def test_postgres_array_runtime_double_to_real(self):
+        real = "ARRAY_MAP(_pg_real_input -> CAST(_pg_real_input AS FLOAT), ARRAY(CAST(x AS DOUBLE)))[1]"
+        for source, expected in (
+            (
+                "ARRAY[x::DOUBLE PRECISION::REAL, 2::DOUBLE PRECISION]",
+                f"CAST(ARRAY({real}, CAST(2 AS DOUBLE)) AS ARRAY<DOUBLE>)",
+            ),
+            (
+                "ARRAY[x::DOUBLE PRECISION::REAL]",
+                f"ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY({real}))",
+            ),
+            (
+                "ARRAY[x::DOUBLE PRECISION::REAL::DOUBLE PRECISION]",
+                f"CAST(ARRAY(CAST({real} AS DOUBLE)) AS ARRAY<DOUBLE>)",
+            ),
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                self.assertEqual(tree.sql("doris", copy=False), expected)
+                self.assertEqual(tree, before)
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
+                self.validate_identity(expected)
+
+        # One evaluation of the input, with no assumption that an unknown column is DOUBLE.
+        source = "ARRAY[custom_value()::DOUBLE PRECISION::REAL]"
+        self.assertEqual(parse_one(source, read="postgres").sql("doris").count("CUSTOM_VALUE()"), 1)
+        for source in ("ARRAY[x::REAL]", "ARRAY[x::DOUBLE PRECISION]", "x::DOUBLE PRECISION::REAL"):
+            with self.subTest(source):
+                self.assertNotIn("_pg_real_input", parse_one(source, read="postgres").sql("doris"))
+        for dialect in ("hive", "doris"):
+            self.assertNotIn(
+                "_pg_real_input",
+                parse_one("ARRAY(CAST(CAST(x AS DOUBLE) AS FLOAT))", read=dialect).sql("doris"),
+            )
+
     def test_array_query_constructor(self):
         for source in (
             "SELECT ARRAY(SELECT 1)",
