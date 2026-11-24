@@ -5,6 +5,143 @@ from tests.dialects.test_dialect import Validator
 class TestDoris(Validator):
     dialect = "doris"
 
+    def test_integer_generate_series(self):
+        for source, expected in (
+            (
+                "SELECT * FROM GENERATE_SERIES(1, 3)",
+                "SELECT * FROM (SELECT CAST(1 + number * 1 AS INT) AS generate_series FROM NUMBERS('number' = '3')) AS generate_series",
+            ),
+            (
+                "SELECT * FROM GENERATE_SERIES(CAST(1 AS INT), CAST(3 AS INT), CAST(1 AS INT))",
+                "SELECT * FROM (SELECT CAST(1 + number * 1 AS INT) AS generate_series FROM NUMBERS('number' = '3')) AS generate_series",
+            ),
+            (
+                "SELECT g, g.g FROM GENERATE_SERIES(3, -2, -2) AS g",
+                "SELECT g, g.g FROM (SELECT CAST(3 + number * -2 AS INT) AS g FROM NUMBERS('number' = '3')) AS g",
+            ),
+            (
+                'SELECT "Value" FROM GENERATE_SERIES(-3, 3, 2) AS "Series"("Value")',
+                "SELECT `Value` FROM (SELECT CAST(-3 + number * 2 AS INT) AS `Value` FROM NUMBERS('number' = '4')) AS `Series`",
+            ),
+            (
+                "SELECT COUNT(*) FROM GENERATE_SERIES(1, 0) g(x)",
+                "SELECT COUNT(*) FROM (SELECT CAST(1 + number * 1 AS INT) AS x FROM NUMBERS('number' = '0')) AS g",
+            ),
+            (
+                "SELECT * FROM GENERATE_SERIES(0, 1, -1)",
+                "SELECT * FROM (SELECT CAST(0 + number * -1 AS INT) AS generate_series FROM NUMBERS('number' = '0')) AS generate_series",
+            ),
+            (
+                "SELECT * FROM GENERATE_SERIES(-2147483648, -2147483646)",
+                "SELECT * FROM (SELECT CAST(-2147483648 + number * 1 AS INT) AS generate_series FROM NUMBERS('number' = '3')) AS generate_series",
+            ),
+            (
+                "SELECT * FROM GENERATE_SERIES(2147483647, 2147483647, -2147483648)",
+                "SELECT * FROM (SELECT CAST(2147483647 + number * -2147483648 AS INT) AS generate_series FROM NUMBERS('number' = '1')) AS generate_series",
+            ),
+            (
+                "SELECT * FROM GENERATE_SERIES(-2147483648, 2147483647)",
+                "SELECT * FROM (SELECT CAST(-2147483648 + number * 1 AS INT) AS generate_series FROM NUMBERS('number' = '4294967296')) AS generate_series",
+            ),
+            (
+                "SELECT * FROM GENERATE_SERIES(1, 1001)",
+                "SELECT * FROM (SELECT CAST(1 + number * 1 AS INT) AS generate_series FROM NUMBERS('number' = '1001')) AS generate_series",
+            ),
+            (
+                "SELECT * FROM GENERATE_SERIES((-1), (1)) g JOIN t ON g = t.x",
+                "SELECT * FROM (SELECT CAST(-1 + number * 1 AS INT) AS g FROM NUMBERS('number' = '3')) AS g JOIN t ON g = t.x",
+            ),
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                original = tree.copy()
+                self.assertEqual(tree.sql("doris", copy=False), expected)
+                self.assertEqual(tree, original)
+                self.validate_all(expected, read={"postgres": source})
+                self.validate_identity(expected)
+
+    def test_integer_generate_series_exclusions(self):
+        for source in (
+            "SELECT GENERATE_SERIES(1, 3)",
+            "SELECT * FROM LATERAL GENERATE_SERIES(1, 3) g(x)",
+            "SELECT * FROM t, GENERATE_SERIES(1, t.x) g(x)",
+            "SELECT * FROM GENERATE_SERIES(1, 3, 0)",
+            "SELECT * FROM GENERATE_SERIES(1.0, 3.0)",
+            "SELECT * FROM GENERATE_SERIES(1::BIGINT, 3)",
+            "SELECT * FROM GENERATE_SERIES(1, 2147483648)",
+            "SELECT * FROM GENERATE_SERIES(1, 3) WITH ORDINALITY AS g(x, n)",
+            "SELECT * FROM GENERATE_SERIES('2024-01-01'::DATE, '2024-01-02'::DATE, '1 day')",
+        ):
+            with self.subTest(source):
+                with self.assertRaises(UnsupportedError):
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    )
+
+        self.validate_all(
+            "SELECT * FROM GENERATE_SERIES(1, 3)",
+            write={"postgres": "SELECT * FROM GENERATE_SERIES(1, 3)"},
+        )
+
+    def test_integer_generate_series_nulls(self):
+        for start, end, step in (
+            ("NULL", "3", "1"),
+            ("1", "NULL", "1"),
+            ("1", "3", "NULL"),
+            ("CAST(NULL AS INT)", "3", "0"),
+            ("1", "CAST(NULL AS INT)", "0"),
+            ("NULL", "NULL", "-1"),
+            ("CAST(NULL AS INT)", "NULL", "NULL"),
+        ):
+            source = f"SELECT x FROM GENERATE_SERIES({start}, {end}, {step}) AS g(x)"
+            comparison_step = f"({step})" if step.startswith("-") else step
+            length = (
+                f"CASE WHEN {start} IS NULL OR {end} IS NULL OR {comparison_step} IS NULL THEN 0 "
+                f"WHEN ({comparison_step} > 0 AND {start} <= {end}) OR ({comparison_step} < 0 AND {start} >= {end}) "
+                f"THEN (CAST({end} AS BIGINT) - CAST({start} AS BIGINT)) DIV NULLIF({step}, 0) + 1 "
+                "ELSE 0 END"
+            )
+            expected = (
+                f"SELECT x FROM (SELECT CAST({start} + _numbers.number * {step} AS INT) AS x "
+                "FROM (SELECT 1 AS seed) AS _series LATERAL VIEW "
+                f"EXPLODE_NUMBERS({length}) _numbers AS number) AS g"
+            )
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                original = tree.copy()
+                self.assertEqual(
+                    tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE), expected
+                )
+                self.assertEqual(tree, original)
+                self.validate_all(expected, read={"postgres": source})
+                self.validate_identity(expected)
+
+        default = parse_one("SELECT * FROM GENERATE_SERIES(NULL, 3)", read="postgres").sql(
+            "doris", unsupported_level=ErrorLevel.RAISE
+        )
+        self.assertIn("AS generate_series", default)
+        self.assertIn("EXPLODE_NUMBERS(CASE WHEN NULL IS NULL OR 3 IS NULL OR 1 IS NULL", default)
+
+    def test_integer_generate_series_nullable_scope(self):
+        for source in (
+            "SELECT * FROM GENERATE_SERIES(NULL::BIGINT, 3)",
+            "SELECT * FROM GENERATE_SERIES(NULL::DECIMAL, 3)",
+            "SELECT * FROM GENERATE_SERIES(NULL, 3.5)",
+            "SELECT * FROM GENERATE_SERIES(NULL, 2147483648)",
+            "SELECT * FROM GENERATE_SERIES(TRUE, 3)",
+            "SELECT * FROM GENERATE_SERIES('1', 3)",
+            "SELECT * FROM GENERATE_SERIES(:start, 3)",
+            "SELECT * FROM GENERATE_SERIES(NULLIF(1, 1), 3)",
+            "SELECT * FROM GENERATE_SERIES(CAST(1 AS INT), 3, 0)",
+            "SELECT * FROM GENERATE_SERIES(1, 3, CAST(0 AS INT))",
+            "SELECT * FROM t, GENERATE_SERIES(CAST(t.x AS INT), 3)",
+        ):
+            with self.subTest(source):
+                with self.assertRaises(UnsupportedError):
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    )
+
     def test_sample_aggregate_nulls(self):
         for source_name, target_name in (
             ("STDDEV", "STDDEV_SAMP"),
