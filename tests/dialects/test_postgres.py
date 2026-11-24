@@ -21,6 +21,8 @@ class TestPostgres(Validator):
             ("ARRAY[2147483648]", "BIGINT"),
             ("ARRAY[NULL]", "TEXT"),
             ("ARRAY['a', 'b']", "TEXT"),
+            ("ARRAY[CAST(1 AS REAL), '1e2']", "FLOAT"),
+            ("ARRAY[CAST(1 AS DOUBLE PRECISION), '1e2']", "DOUBLE"),
         ):
             with self.subTest(source):
                 tree = self.validate_identity(source)

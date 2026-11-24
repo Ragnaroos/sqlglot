@@ -1,3 +1,5 @@
+from decimal import Decimal, localcontext
+
 from sqlglot import ErrorLevel, ParseError, UnsupportedError, exp, parse_one
 from tests.dialects.test_dialect import Validator
 
@@ -807,6 +809,105 @@ class TestDoris(Validator):
                 parse_one("ARRAY('0x7f', 1)", read=dialect).sql("doris"),
                 "ARRAY('0x7f', 1)",
             )
+
+    def test_postgres_array_float_inputs(self):
+        for source, expected in (
+            (
+                "ARRAY[1::REAL, '1e2', NULL, '1e2']",
+                "ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(CAST(1 AS FLOAT), CAST('100' AS DOUBLE), NULL, CAST('100' AS DOUBLE)))",
+            ),
+            (
+                "ARRAY['  +1.5 ', 1::DOUBLE PRECISION]",
+                "CAST(ARRAY(CAST('1.5' AS DOUBLE), CAST(1 AS DOUBLE)) AS ARRAY<DOUBLE>)",
+            ),
+            (
+                "ARRAY['-0', 1::REAL]",
+                "ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(CAST('-0' AS DOUBLE), CAST(1 AS FLOAT)))",
+            ),
+            (
+                "ARRAY[1::REAL, '7.038531e-26']",
+                "ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(CAST(1 AS FLOAT), CAST('0.00000000000000000000000007038530691851209120859188017140306974105991300039164570989669300615787506103515625' AS DOUBLE)))",
+            ),
+            (
+                "ARRAY['1.0000000596046447753906250000000000001', 1::REAL]",
+                "ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(CAST('1.00000011920928955078125' AS DOUBLE), CAST(1 AS FLOAT)))",
+            ),
+            (
+                "ARRAY['1.000000059604644775390625', 1::REAL]",
+                "ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(CAST('1' AS DOUBLE), CAST(1 AS FLOAT)))",
+            ),
+            (
+                "ARRAY['1.5', 1]::REAL[]",
+                "CAST(ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(CAST('1.5' AS DOUBLE), 1)) AS ARRAY<FLOAT>)",
+            ),
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                self.assertEqual(
+                    tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE), expected
+                )
+                self.assertEqual(tree, before)
+                self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
+                self.validate_identity(expected)
+
+        for value in (
+            "1e400",
+            "1e-4000",
+            "1e99999999999999999999",
+            "0x1.8p+1",
+            "NaN",
+            "Infinity",
+            "1_000",
+            "",
+            "１",
+            "1" * 4097,
+        ):
+            with self.subTest(value):
+                with self.assertRaisesRegex(UnsupportedError, "array input"):
+                    parse_one(f"ARRAY[1::REAL, '{value}']", read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    )
+
+        for dialect in ("hive", "doris"):
+            self.assertEqual(
+                parse_one("ARRAY(CAST(1 AS FLOAT), '1e2')", read=dialect).sql("doris"),
+                "ARRAY(CAST(1 AS FLOAT), '1e2')",
+            )
+
+        for dtype, value, hexadecimal in (
+            ("REAL", "7.038531e-26", "0x1.5c87fap-84"),
+            ("REAL", "1.000000059604644775390625", "0x1p0"),
+            ("REAL", "1.0000000596046447753906250000000000001", "0x1.000002p0"),
+            ("REAL", "1.000000178813934326171875", "0x1.000004p0"),
+            ("REAL", "1e-45", "0x1p-149"),
+            ("REAL", "3.4028234663852886e38", "0x1.fffffep127"),
+            ("DOUBLE PRECISION", "9007199254740993", "0x1p53"),
+            ("DOUBLE PRECISION", "4.9406564584124654e-324", "0x1p-1074"),
+            ("DOUBLE PRECISION", "1.7976931348623157e308", "0x1.fffffffffffffp1023"),
+        ):
+            with self.subTest(dtype=dtype, value=value), localcontext() as context:
+                context.prec = 2
+                target = parse_one(f"ARRAY['{value}', CAST(1 AS {dtype})]", read="postgres").sql(
+                    "doris", unsupported_level=ErrorLevel.RAISE
+                )
+                literal = next(parse_one(target, read="doris").find_all(exp.Literal))
+                self.assertEqual(
+                    Decimal(literal.to_py()), Decimal.from_float(float.fromhex(hexadecimal))
+                )
+
+        for source in (
+            "ARRAY[ARRAY['7.038531e-26', 1::REAL], ARRAY['1e2', NULL::REAL]]",
+            "ARRAY[ARRAY['7.038531e-26', 1], ARRAY['1e2', NULL]]::REAL[][]",
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree, before)
+                self.assertEqual(target.count("ARRAY_MAP"), 2)
+                self.assertIn("ARRAY<ARRAY<FLOAT>>", target)
+                self.validate_identity(target)
 
     def test_array_query_constructor(self):
         for source in (

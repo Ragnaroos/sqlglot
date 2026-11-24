@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import typing as t
+from decimal import Decimal, InvalidOperation
 
 from sqlglot import exp
 from sqlglot.dialects.dialect import (
@@ -20,6 +21,7 @@ _PG_INTEGER_INPUT = re.compile(
     r"[+-]?(?:[0-9](?:_?[0-9])*|0[xX]_?[0-9a-fA-F](?:_?[0-9a-fA-F])*"
     r"|0[oO]_?[0-7](?:_?[0-7])*|0[bB]_?[01](?:_?[01])*)"
 )
+_PG_DECIMAL_FLOAT_INPUT = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 
 
 def _lag_lead_sql(self, expression: exp.Lag | exp.Lead) -> str:
@@ -292,7 +294,7 @@ class DorisGenerator(MySQLGenerator):
         if (
             expression.to.is_type(exp.DType.ARRAY)
             and isinstance(value, exp.Array)
-            and value.args.get("element_type")
+            and any(array.args.get("element_type") for array in value.find_all(exp.Array))
         ):
             # PG applies the explicit constructor cast to unknown elements,
             # overriding the constructor's provisional common type.
@@ -312,6 +314,8 @@ class DorisGenerator(MySQLGenerator):
                 exp.DType.SMALLINT,
                 exp.DType.INT,
                 exp.DType.BIGINT,
+                exp.DType.FLOAT,
+                exp.DType.DOUBLE,
             )
             else None,
         )
@@ -333,10 +337,22 @@ class DorisGenerator(MySQLGenerator):
         if element_type:
             array = expression.copy()
             array.set("element_type", None)
+            runtime_float = element_type.is_type(exp.DType.FLOAT) and any(
+                value.unnest().is_string for value in expressions
+            )
             array.set(
                 "expressions",
                 [self._coerce_array_input(value, element_type) for value in expressions],
             )
+            if runtime_float:
+                # Keep FLOAT conversion inside a lambda: Doris's constant FLOAT
+                # array cast can change the already rounded input once more.
+                parameter = exp.to_identifier("_pg_array_value")
+                return self.func(
+                    "ARRAY_MAP",
+                    exp.Lambda(this=exp.cast(parameter, exp.DType.FLOAT), expressions=[parameter]),
+                    array,
+                )
             return super().cast_sql(
                 exp.cast(
                     array,
@@ -376,13 +392,54 @@ class DorisGenerator(MySQLGenerator):
             }
             if len(matches) == 1:
                 normalized = matches.pop()
+        elif dtype.is_type(exp.DType.FLOAT, exp.DType.DOUBLE):
+            normalized = self._array_float_input(value, dtype)
 
         if normalized is None:
             self.unsupported("Doris cannot preserve this PostgreSQL array input conversion")
         else:
             literal = literal.copy()
             literal.set("this", normalized)
-        return exp.cast(literal.copy(), dtype.copy())
+        return exp.cast(
+            literal.copy(),
+            exp.DType.DOUBLE if dtype.is_type(exp.DType.FLOAT) else dtype.copy(),
+        )
+
+    def _array_float_input(self, value: str, dtype: exp.DataType) -> str | None:
+        # Round decimal input directly to the source IEEE format: Doris can
+        # round through DOUBLE before storing FLOAT, unlike PostgreSQL strtof.
+        # Bound work before constructing the exact ratio for extreme exponents.
+        if len(value) > 4096 or not _PG_DECIMAL_FLOAT_INPUT.fullmatch(value):
+            return None
+        try:
+            number = Decimal(value)
+        except InvalidOperation:
+            return None
+        if not number:
+            return "-0" if number.is_signed() else "0"
+        precision, minimum, maximum, decimal_minimum, decimal_maximum = (
+            (24, -149, 127, -46, 38)
+            if dtype.is_type(exp.DType.FLOAT)
+            else (53, -1074, 1023, -324, 308)
+        )
+        if not decimal_minimum <= number.adjusted() <= decimal_maximum:
+            return None
+        numerator, denominator = number.copy_abs().as_integer_ratio()
+        exponent = numerator.bit_length() - denominator.bit_length()
+        if (numerator << max(0, -exponent)) < (denominator << max(0, exponent)):
+            exponent -= 1
+        shift = max(exponent - precision + 1, minimum)
+        scaled_denominator = denominator << max(0, shift)
+        significand, remainder = divmod(numerator << max(0, -shift), scaled_denominator)
+        if 2 * remainder > scaled_denominator or (
+            2 * remainder == scaled_denominator and significand % 2
+        ):
+            significand += 1
+        if not significand or significand.bit_length() + shift - 1 > maximum:
+            return None
+        integer = significand << shift if shift >= 0 else significand * 5 ** (-shift)
+        decimal = Decimal((int(number.is_signed()), tuple(map(int, str(integer))), min(shift, 0)))
+        return format(decimal, "f").rstrip("0").rstrip(".") if shift < 0 else str(decimal)
 
     def match_sql(self, expression: exp.Match) -> str:
         kind = expression.text("kind")
