@@ -118,7 +118,7 @@ class CovarPop(Expression, AggFunc):
 
 
 class CovarSamp(Expression, AggFunc):
-    arg_types = {"this": True, "expression": True}
+    arg_types = {"this": True, "expression": True, "null_on_insufficient_samples": False}
 
 
 class CumeDist(Expression, AggFunc):
@@ -313,6 +313,7 @@ class Skewness(Expression, AggFunc):
 
 
 class Stddev(Expression, AggFunc):
+    arg_types = {"this": True, "null_on_insufficient_samples": False}
     _sql_names = ["STDDEV", "STDEV"]
 
 
@@ -321,7 +322,7 @@ class StddevPop(Expression, AggFunc):
 
 
 class StddevSamp(Expression, AggFunc):
-    pass
+    arg_types = {"this": True, "null_on_insufficient_samples": False}
 
 
 class Sum(Expression, AggFunc):
@@ -330,7 +331,11 @@ class Sum(Expression, AggFunc):
 
 class Variance(Expression, AggFunc):
     # single_value_returns_zero: Oracle's VARIANCE returns 0 instead of NULL for a single value
-    arg_types = {"this": True, "single_value_returns_zero": False}
+    arg_types = {
+        "this": True,
+        "single_value_returns_zero": False,
+        "null_on_insufficient_samples": False,
+    }
     _sql_names = ["VARIANCE", "VARIANCE_SAMP", "VAR_SAMP"]
 
 

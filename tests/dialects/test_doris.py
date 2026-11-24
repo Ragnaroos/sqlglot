@@ -5,6 +5,80 @@ from tests.dialects.test_dialect import Validator
 class TestDoris(Validator):
     dialect = "doris"
 
+    def test_sample_aggregate_nulls(self):
+        for source_name, target_name in (
+            ("STDDEV", "STDDEV_SAMP"),
+            ("STDDEV_SAMP", "STDDEV_SAMP"),
+            ("VARIANCE", "VAR_SAMP"),
+            ("VAR_SAMP", "VAR_SAMP"),
+        ):
+            for argument in ("x", "DISTINCT x", "CAST(NULL AS DOUBLE)"):
+                source = f"SELECT {source_name}({argument}) AS v FROM t"
+                expected = (
+                    f"SELECT IF(COUNT({argument}) < 2, NULL, {target_name}({argument})) AS v FROM t"
+                )
+                with self.subTest(source):
+                    tree = parse_one(source, read="postgres")
+                    original = tree.copy()
+                    self.assertEqual(tree.sql("doris", copy=False), expected)
+                    self.assertEqual(tree, original)
+                    self.validate_all(expected, read={"postgres": source})
+                    self.validate_identity(expected)
+
+        for source, expected in (
+            (
+                "SELECT COVAR_SAMP(x, y) AS v FROM t",
+                "SELECT IF(COUNT(IF(x IS NULL, NULL, y)) < 2, NULL, COVAR_SAMP(x, y)) AS v FROM t",
+            ),
+            (
+                "SELECT g, VAR_SAMP(x) AS v FROM t GROUP BY g HAVING VAR_SAMP(x) IS NULL ORDER BY g",
+                "SELECT g, IF(COUNT(x) < 2, NULL, VAR_SAMP(x)) AS v FROM t GROUP BY g HAVING IF(COUNT(x) < 2, NULL, VAR_SAMP(x)) IS NULL ORDER BY g NULLS LAST",
+            ),
+            (
+                "SELECT (SELECT STDDEV_SAMP(x) FROM t WHERE FALSE) AS v",
+                "SELECT (SELECT IF(COUNT(x) < 2, NULL, STDDEV_SAMP(x)) FROM t WHERE FALSE) AS v",
+            ),
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                original = tree.copy()
+                self.assertEqual(tree.sql("doris", copy=False), expected)
+                self.assertEqual(tree, original)
+                self.validate_all(expected, read={"postgres": source})
+                self.validate_identity(expected)
+
+    def test_sample_aggregate_exclusions(self):
+        for sql in (
+            "SELECT STDDEV_SAMP(x) OVER () FROM t",
+            "SELECT VAR_SAMP(x) OVER () FROM t",
+            "SELECT COVAR_SAMP(x, y) OVER () FROM t",
+            "SELECT STDDEV_SAMP(x) FILTER(WHERE p) FROM t",
+            "SELECT VAR_SAMP(x ORDER BY y) FROM t",
+            "SELECT STDDEV_POP(x), VAR_POP(x), COVAR_POP(x, y) FROM t",
+        ):
+            with self.subTest(sql):
+                expected = sql.replace("ORDER BY y", "ORDER BY y NULLS LAST")
+                self.assertEqual(parse_one(sql, read="postgres").sql("doris"), expected)
+
+        for sql in (
+            "SELECT STDDEV_SAMP(x), VAR_SAMP(x), COVAR_SAMP(x, y) FROM t",
+            "SELECT STDDEV_POP(x), VAR_POP(x) FROM t",
+        ):
+            self.validate_identity(sql)
+
+        self.validate_all(
+            "SELECT VAR_SAMP(x) FROM t",
+            read={"bigquery": "SELECT VAR_SAMP(x) FROM t"},
+        )
+        self.validate_all(
+            "SELECT CASE COUNT(x) WHEN 0 THEN NULL WHEN 1 THEN 0 ELSE VAR_SAMP(x) END FROM t",
+            read={"oracle": "SELECT VARIANCE(x) FROM t"},
+        )
+        self.validate_all(
+            "SELECT STDDEV_POP(x), VAR_POP(x) FROM t",
+            read={"mysql": "SELECT STDDEV(x), VARIANCE(x) FROM t"},
+        )
+
     def test_boolean_every(self):
         self.validate_all(
             "SELECT MIN(b) AS v FROM t",

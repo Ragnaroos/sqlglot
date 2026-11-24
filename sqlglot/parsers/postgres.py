@@ -146,6 +146,11 @@ class PostgresParser(parser.Parser):
         "BIT_XOR": exp.BitwiseXorAgg.from_arg_list,
         "BTRIM": exp.Trim.from_arg_list,
         "CARDINALITY": exp.ArraySize.from_arg_list,
+        "COVAR_SAMP": lambda args: exp.CovarSamp(
+            this=seq_get(args, 0),
+            expression=seq_get(args, 1),
+            null_on_insufficient_samples=True,
+        ),
         "VERSION": exp.CurrentVersion.from_arg_list,
         "DATE_TRUNC": build_timestamp_trunc,
         "DIV": lambda args: exp.cast(binary_from_function(exp.IntDiv)(args), exp.DType.DECIMAL),
@@ -163,6 +168,10 @@ class PostgresParser(parser.Parser):
         "MAKE_TIMESTAMP": exp.TimestampFromParts.from_arg_list,
         "NOW": exp.CurrentTimestamp.from_arg_list,
         "REGEXP_REPLACE": _build_regexp_replace,
+        "STDDEV": lambda args: exp.Stddev(this=seq_get(args, 0), null_on_insufficient_samples=True),
+        "STDDEV_SAMP": lambda args: exp.StddevSamp(
+            this=seq_get(args, 0), null_on_insufficient_samples=True
+        ),
         "TO_CHAR": build_formatted_time(exp.TimeToStr),
         "TO_DATE": build_formatted_time(exp.StrToDate),
         "TO_TIMESTAMP": _build_to_timestamp,
@@ -179,6 +188,12 @@ class PostgresParser(parser.Parser):
         "LEVENSHTEIN_LESS_EQUAL": _build_levenshtein_less_equal,
         "JSON_OBJECT_AGG": lambda args: exp.JSONObjectAgg(expressions=args),
         "JSONB_OBJECT_AGG": exp.JSONBObjectAgg.from_arg_list,
+        "VARIANCE": lambda args: exp.Variance(
+            this=seq_get(args, 0), null_on_insufficient_samples=True
+        ),
+        "VAR_SAMP": lambda args: exp.Variance(
+            this=seq_get(args, 0), null_on_insufficient_samples=True
+        ),
         "WIDTH_BUCKET": lambda args: (
             exp.WidthBucket(this=seq_get(args, 0), threshold=seq_get(args, 1))
             if len(args) == 2
