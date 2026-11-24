@@ -855,8 +855,6 @@ class TestDoris(Validator):
             "1e400",
             "1e-4000",
             "1e99999999999999999999",
-            "NaN",
-            "Infinity",
             "1_000",
             "",
             "１",
@@ -983,7 +981,7 @@ class TestDoris(Validator):
                 "ARRAY(CAST(0.1 AS FLOAT))",
             )
         self.assertEqual(parse_one("0.1::REAL", read="postgres").sql("doris"), "CAST(0.1 AS FLOAT)")
-        for source in ("ARRAY[x::REAL]", "ARRAY['NaN'::REAL]"):
+        for source in ("ARRAY[x::REAL]",):
             self.assertNotIn("ARRAY_MAP", parse_one(source, read="postgres").sql("doris"))
 
     def test_postgres_array_scalar_real_inputs(self):
@@ -1074,6 +1072,36 @@ class TestDoris(Validator):
             parse_one("'0x1.8p0'::DOUBLE PRECISION", read="postgres").sql("doris"),
             "CAST('0x1.8p0' AS DOUBLE)",
         )
+
+    def test_postgres_array_nonfinite_float_inputs(self):
+        for value, normalized in (
+            ("NaN", "NaN"),
+            ("+nAn", "NaN"),
+            ("-NaN", "NaN"),
+            (" inf ", "Infinity"),
+            ("+INF", "Infinity"),
+            ("-infinity", "-Infinity"),
+        ):
+            for dtype in ("REAL", "DOUBLE PRECISION"):
+                with self.subTest(value=value, dtype=dtype):
+                    tree = parse_one(f"ARRAY[1::{dtype}, '{value}', NULL]", read="postgres")
+                    before = tree.copy()
+                    target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                    self.assertIn(f"CAST('{normalized}' AS DOUBLE)", target)
+                    self.assertEqual(tree, before)
+                    self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                    self.validate_identity(target)
+
+        self.validate_all(
+            "ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(CAST('NaN' AS DOUBLE)))",
+            read={"postgres": "ARRAY['NaN'::REAL]"},
+        )
+        for value in ("nan(payload)", "nans", "infi", "Infinity!", "1e400"):
+            with self.subTest(value):
+                with self.assertRaises(UnsupportedError):
+                    parse_one(f"ARRAY[1::REAL, '{value}']", read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    )
 
     def test_array_query_constructor(self):
         for source in (

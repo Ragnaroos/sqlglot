@@ -482,6 +482,12 @@ class DorisGenerator(MySQLGenerator):
         # Bound work before constructing the exact ratio for extreme exponents.
         if len(value) > 4096:
             return None
+        if re.fullmatch(r"[+-]?(?:nan|inf(?:inity)?)", value, re.IGNORECASE):
+            return (
+                "NaN"
+                if value.lstrip("+-").lower() == "nan"
+                else ("-Infinity" if value.startswith("-") else "Infinity")
+            )
         precision, minimum, maximum, decimal_minimum, decimal_maximum = (
             (24, -149, 127, -46, 38)
             if dtype.is_type(exp.DType.FLOAT)
