@@ -612,17 +612,17 @@ class TestDoris(Validator):
 
     def test_array_constructor(self):
         for source, expected in (
-            ("SELECT ARRAY[1, 2]", "SELECT ARRAY(1, 2)"),
-            ("SELECT ARRAY[1, NULL, 2, 1]", "SELECT ARRAY(1, NULL, 2, 1)"),
-            ("SELECT ARRAY[NULL]", "SELECT ARRAY(NULL)"),
+            ("SELECT ARRAY[1, 2]", "SELECT CAST(ARRAY(1, 2) AS ARRAY<INT>)"),
+            ("SELECT ARRAY[1, NULL, 2, 1]", "SELECT CAST(ARRAY(1, NULL, 2, 1) AS ARRAY<INT>)"),
+            ("SELECT ARRAY[NULL]", "SELECT CAST(ARRAY(NULL) AS ARRAY<STRING>)"),
             ("SELECT ARRAY[]::INT[]", "SELECT CAST(ARRAY() AS ARRAY<INT>)"),
             (
                 "SELECT ARRAY[[1, 2], [3, 4]]",
-                "SELECT ARRAY(ARRAY(1, 2), ARRAY(3, 4))",
+                "SELECT CAST(ARRAY(CAST(ARRAY(1, 2) AS ARRAY<INT>), CAST(ARRAY(3, 4) AS ARRAY<INT>)) AS ARRAY<ARRAY<INT>>)",
             ),
             (
                 "SELECT ARRAY[1::BIGINT, NULL::BIGINT]",
-                "SELECT ARRAY(CAST(1 AS BIGINT), CAST(NULL AS BIGINT))",
+                "SELECT CAST(ARRAY(CAST(1 AS BIGINT), CAST(NULL AS BIGINT)) AS ARRAY<BIGINT>)",
             ),
             (
                 "SELECT ARRAY[1.25::DECIMAL(10, 2), NULL::DECIMAL(10, 2)]",
@@ -630,21 +630,21 @@ class TestDoris(Validator):
             ),
             (
                 "SELECT ARRAY['hello', 'world', '']",
-                "SELECT ARRAY('hello', 'world', '')",
+                "SELECT CAST(ARRAY('hello', 'world', '') AS ARRAY<STRING>)",
             ),
             ("SELECT ARRAY[x, NULL] FROM t", "SELECT ARRAY(x, NULL) FROM t"),
-            ("SELECT ARRAY[(SELECT 1)]", "SELECT ARRAY((SELECT 1))"),
+            ("SELECT ARRAY[(SELECT 1)]", "SELECT CAST(ARRAY((SELECT 1)) AS ARRAY<INT>)"),
             (
                 "SELECT ARRAY[(SELECT 1 WHERE FALSE)]",
-                "SELECT ARRAY((SELECT 1 WHERE FALSE))",
+                "SELECT CAST(ARRAY((SELECT 1 WHERE FALSE)) AS ARRAY<INT>)",
             ),
             (
                 "SELECT ARRAY[(SELECT 1), (SELECT 2)]",
-                "SELECT ARRAY((SELECT 1), (SELECT 2))",
+                "SELECT CAST(ARRAY((SELECT 1), (SELECT 2)) AS ARRAY<INT>)",
             ),
             (
                 "SELECT any_value(v) FROM (VALUES (ARRAY['hello', 'world'])) AS v(v)",
-                "SELECT ANY_VALUE(v) FROM (SELECT ARRAY('hello', 'world') AS v) AS v",
+                "SELECT ANY_VALUE(v) FROM (SELECT CAST(ARRAY('hello', 'world') AS ARRAY<STRING>) AS v) AS v",
             ),
         ):
             with self.subTest(source):
@@ -679,6 +679,41 @@ class TestDoris(Validator):
             parse_one("SELECT ARRAY[1, 2]", read="postgres").sql(
                 "mysql", unsupported_level=ErrorLevel.RAISE
             )
+
+    def test_postgres_array_element_types(self):
+        for source, dtype in (
+            ("ARRAY[0, 127, 128, NULL]", "INT"),
+            ("ARRAY[-2147483648, 2147483647]", "INT"),
+            ("ARRAY[2147483648, 1]", "BIGINT"),
+            ("ARRAY[-9223372036854775808, 9223372036854775807]", "BIGINT"),
+            ("ARRAY[(SELECT 2147483648 AS n)]", "BIGINT"),
+            ("ARRAY[(SELECT NULL)]", "STRING"),
+            ("ARRAY[NULL, NULL]", "STRING"),
+            ("ARRAY['世界', '', NULL]", "STRING"),
+            ("ARRAY[TRUE, FALSE, NULL]", "BOOLEAN"),
+            ("ARRAY[CAST(1 AS SMALLINT), CAST(2 AS INT)]", "INT"),
+            ("ARRAY[CAST(1 AS REAL), 2]", "FLOAT"),
+        ):
+            with self.subTest(source):
+                tree = parse_one(f"SELECT {source} AS xs", read="postgres")
+                original = tree.copy()
+                target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree, original)
+                self.assertIsInstance(parse_one(target, read="doris").expressions[0].this, exp.Cast)
+                self.assertTrue(target.endswith(f"AS ARRAY<{dtype}>) AS xs"))
+                self.validate_identity(target)
+
+        # Do not guess a schema or use generic DOUBLE inference for PG NUMERIC.
+        for source in (
+            "ARRAY[x, NULL]",
+            "ARRAY[:x, NULL]",
+            "ARRAY[1.25, 2]",
+            "ARRAY[9223372036854775808]",
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                self.assertNotIn("element_type", tree.args)
+                self.assertFalse(tree.sql("doris").startswith("CAST("))
 
     def test_array_query_constructor(self):
         for source in (

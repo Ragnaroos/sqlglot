@@ -19,11 +19,14 @@ from sqlglot.expressions.query import UDTF
 
 
 class Array(Expression, Func):
+    """Array constructor with an optional source-resolved element type."""
+
     arg_types = {
         "expressions": False,
         "bracket_notation": False,
         "struct_name_inheritance": False,
         "value_constructor": False,
+        "element_type": False,
     }
     is_var_len_args = True
 
