@@ -23,6 +23,8 @@ class TestPostgres(Validator):
             ("ARRAY['a', 'b']", "TEXT"),
             ("ARRAY[CAST(1 AS REAL), '1e2']", "FLOAT"),
             ("ARRAY[CAST(1 AS DOUBLE PRECISION), '1e2']", "DOUBLE"),
+            ("ARRAY[-CAST(0.1 AS REAL), NULL]", "FLOAT"),
+            ("ARRAY[-CAST(0.1 AS REAL), CAST(2 AS DOUBLE PRECISION)]", "DOUBLE"),
         ):
             with self.subTest(source):
                 tree = self.validate_identity(source)

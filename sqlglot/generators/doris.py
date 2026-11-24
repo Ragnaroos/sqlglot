@@ -337,13 +337,11 @@ class DorisGenerator(MySQLGenerator):
         if element_type:
             array = expression.copy()
             array.set("element_type", None)
+            inputs = [self._coerce_array_input(value, element_type) for value in expressions]
             runtime_float = element_type.is_type(exp.DType.FLOAT) and any(
-                value.unnest().is_string for value in expressions
+                value != converted for value, converted in zip(expressions, inputs)
             )
-            array.set(
-                "expressions",
-                [self._coerce_array_input(value, element_type) for value in expressions],
-            )
+            array.set("expressions", inputs)
             if runtime_float:
                 # Keep FLOAT conversion inside a lambda: Doris's constant FLOAT
                 # array cast can change the already rounded input once more.
@@ -365,6 +363,45 @@ class DorisGenerator(MySQLGenerator):
 
     def _coerce_array_input(self, expression: exp.Expr, dtype: exp.DataType) -> exp.Expr:
         literal = expression.unnest()
+        if dtype.is_type(exp.DType.FLOAT, exp.DType.DOUBLE):
+            if isinstance(literal, exp.Neg):
+                value = self._coerce_array_input(literal.this, dtype)
+                return exp.Neg(this=value) if value != literal.this else expression.copy()
+            casts: list[exp.DataType | None] = []
+            value = literal
+            while True:
+                if type(value) is exp.Cast and value.to.is_type(exp.DType.FLOAT, exp.DType.DOUBLE):
+                    casts.append(value.to)
+                elif isinstance(value, exp.Neg) and not value.is_number:
+                    casts.append(None)
+                else:
+                    break
+                value = value.this.unnest()
+            if any(cast is not None and cast.is_type(exp.DType.FLOAT) for cast in casts) and (
+                value.is_string or value.is_number
+            ):
+                original = (
+                    "-" + str(value.this.to_py())
+                    if isinstance(value, exp.Neg)
+                    else str(value.to_py())
+                ).strip(" \t\n\r\f\v")
+                normalized = original
+                for cast in reversed(casts):
+                    if cast is None:
+                        normalized = (
+                            normalized[1:] if normalized.startswith("-") else "-" + normalized
+                        )
+                        continue
+                    rounded = self._array_float_input(normalized, cast)
+                    if rounded is None:
+                        # Non-finite and unsupported cast inputs retain their
+                        # existing generation outside this finite-input rule.
+                        return expression.copy()
+                    normalized = rounded
+                # Preserve each source cast before promotion to the ARRAY's type.
+                # Exact inputs can retain their existing CASTs unchanged.
+                if Decimal(normalized) != Decimal(original):
+                    return exp.cast(exp.Literal.string(normalized), exp.DType.DOUBLE)
         if not literal.is_string or dtype.is_type(exp.DType.TEXT):
             return expression.copy()
 

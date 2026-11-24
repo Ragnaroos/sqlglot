@@ -53,6 +53,10 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
                 return dtype.copy()
         elif isinstance(expression, exp.Boolean):
             return exp.DataType.build(exp.DType.BOOLEAN)
+        elif isinstance(expression, exp.Neg):
+            dtype = resolve(expression.this)
+            if dtype and dtype.is_type(exp.DType.FLOAT, exp.DType.DOUBLE):
+                return dtype
         elif isinstance(expression, exp.Array):
             dtype = expression.args.get("element_type")
             if dtype:

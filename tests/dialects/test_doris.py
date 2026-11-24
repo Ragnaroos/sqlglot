@@ -909,6 +909,84 @@ class TestDoris(Validator):
                 self.assertIn("ARRAY<ARRAY<FLOAT>>", target)
                 self.validate_identity(target)
 
+    def test_postgres_array_real_cast_inputs(self):
+        for source, expected in (
+            (
+                "ARRAY[0.1::REAL]",
+                "ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(CAST('0.100000001490116119384765625' AS DOUBLE)))",
+            ),
+            (
+                "ARRAY['1e2', 0.1::REAL, 2::DOUBLE PRECISION]",
+                "CAST(ARRAY(CAST('100' AS DOUBLE), CAST('0.100000001490116119384765625' AS DOUBLE), CAST(2 AS DOUBLE)) AS ARRAY<DOUBLE>)",
+            ),
+            (
+                "ARRAY['1e2', '7.038531e-26'::REAL]",
+                "ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(CAST('100' AS DOUBLE), CAST('0.00000000000000000000000007038530691851209120859188017140306974105991300039164570989669300615787506103515625' AS DOUBLE)))",
+            ),
+            (
+                "ARRAY['1.0000000596046447753906250000000000001'::DOUBLE PRECISION::REAL]",
+                "ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(CAST('1' AS DOUBLE)))",
+            ),
+            (
+                "ARRAY['1.0000000596046447753906250000000000001'::REAL::DOUBLE PRECISION]",
+                "CAST(ARRAY(CAST('1.00000011920928955078125' AS DOUBLE)) AS ARRAY<DOUBLE>)",
+            ),
+            (
+                "ARRAY[-0.1::REAL, NULL::REAL]",
+                "ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(-CAST('0.100000001490116119384765625' AS DOUBLE), CAST(NULL AS FLOAT)))",
+            ),
+            (
+                "ARRAY[CAST(-0.1 AS REAL)]",
+                "ARRAY_MAP(_pg_array_value -> CAST(_pg_array_value AS FLOAT), ARRAY(CAST('-0.100000001490116119384765625' AS DOUBLE)))",
+            ),
+            (
+                "ARRAY[CAST(-CAST(0.1 AS REAL) AS DOUBLE PRECISION)]",
+                "CAST(ARRAY(CAST('-0.100000001490116119384765625' AS DOUBLE)) AS ARRAY<DOUBLE>)",
+            ),
+            (
+                "ARRAY[1::REAL, 0.5::REAL, NULL::REAL]",
+                "CAST(ARRAY(CAST(1 AS FLOAT), CAST(0.5 AS FLOAT), CAST(NULL AS FLOAT)) AS ARRAY<FLOAT>)",
+            ),
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                self.assertEqual(
+                    tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE), expected
+                )
+                self.assertEqual(tree, before)
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
+                self.validate_identity(expected)
+
+        for source, hexadecimal in (
+            ("ARRAY[(-1.0000000596046447753906250000000000001)::REAL]", "-0x1.000002p0"),
+            ("ARRAY['-1.0000000596046447753906250000000000001'::REAL]", "-0x1.000002p0"),
+            ("ARRAY['1e-45'::REAL]", "0x1p-149"),
+            ("ARRAY['3.4028234663852886e38'::REAL]", "0x1.fffffep127"),
+        ):
+            with self.subTest(source), localcontext() as context:
+                context.prec = 2
+                target = parse_one(source, read="postgres").sql(
+                    "doris", unsupported_level=ErrorLevel.RAISE
+                )
+                literal = next(
+                    v for v in parse_one(target, read="doris").find_all(exp.Literal) if v.is_string
+                )
+                self.assertEqual(
+                    Decimal(literal.to_py()), Decimal.from_float(float.fromhex(hexadecimal))
+                )
+
+        # No PostgreSQL ARRAY type hint, no change to other dialects or scalar CASTs.
+        for dialect in ("hive", "doris"):
+            self.assertEqual(
+                parse_one("ARRAY(CAST(0.1 AS FLOAT))", read=dialect).sql("doris"),
+                "ARRAY(CAST(0.1 AS FLOAT))",
+            )
+        self.assertEqual(parse_one("0.1::REAL", read="postgres").sql("doris"), "CAST(0.1 AS FLOAT)")
+        for source in ("ARRAY[x::REAL]", "ARRAY[(SELECT 0.1::REAL)]", "ARRAY['NaN'::REAL]"):
+            self.assertNotIn("ARRAY_MAP", parse_one(source, read="postgres").sql("doris"))
+
     def test_array_query_constructor(self):
         for source in (
             "SELECT ARRAY(SELECT 1)",
