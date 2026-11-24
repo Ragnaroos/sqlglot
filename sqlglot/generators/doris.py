@@ -22,6 +22,10 @@ _PG_INTEGER_INPUT = re.compile(
     r"|0[oO]_?[0-7](?:_?[0-7])*|0[bB]_?[01](?:_?[01])*)"
 )
 _PG_DECIMAL_FLOAT_INPUT = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+_PG_HEX_FLOAT_INPUT = re.compile(
+    r"([+-]?)0[xX]([0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?|\.[0-9a-fA-F]+)"
+    r"(?:[pP]([+-]?[0-9]+))?"
+)
 
 
 def _lag_lead_sql(self, expression: exp.Lag | exp.Lead) -> str:
@@ -398,8 +402,13 @@ class DorisGenerator(MySQLGenerator):
                 else:
                     break
                 value = value.this.unnest()
-            if any(cast is not None and cast.is_type(exp.DType.FLOAT) for cast in casts) and (
-                value.is_string or value.is_number
+            if (
+                casts
+                and (value.is_string or value.is_number)
+                and (
+                    any(cast is not None and cast.is_type(exp.DType.FLOAT) for cast in casts)
+                    or (value.is_string and _PG_HEX_FLOAT_INPUT.fullmatch(value.to_py().strip()))
+                )
             ):
                 original = (
                     "-" + str(value.this.to_py())
@@ -421,7 +430,11 @@ class DorisGenerator(MySQLGenerator):
                     normalized = rounded
                 # Preserve each source cast before promotion to the ARRAY's type.
                 # Exact inputs can retain their existing CASTs unchanged.
-                if Decimal(normalized) != Decimal(original):
+                try:
+                    unchanged = Decimal(normalized) == Decimal(original)
+                except InvalidOperation:
+                    unchanged = False
+                if not unchanged:
                     return exp.cast(exp.Literal.string(normalized), exp.DType.DOUBLE)
         if not literal.is_string or dtype.is_type(exp.DType.TEXT):
             return expression.copy()
@@ -464,25 +477,40 @@ class DorisGenerator(MySQLGenerator):
         )
 
     def _array_float_input(self, value: str, dtype: exp.DataType) -> str | None:
-        # Round decimal input directly to the source IEEE format: Doris can
+        # Round input directly to the source IEEE format: Doris can
         # round through DOUBLE before storing FLOAT, unlike PostgreSQL strtof.
         # Bound work before constructing the exact ratio for extreme exponents.
-        if len(value) > 4096 or not _PG_DECIMAL_FLOAT_INPUT.fullmatch(value):
+        if len(value) > 4096:
             return None
-        try:
-            number = Decimal(value)
-        except InvalidOperation:
-            return None
-        if not number:
-            return "-0" if number.is_signed() else "0"
         precision, minimum, maximum, decimal_minimum, decimal_maximum = (
             (24, -149, 127, -46, 38)
             if dtype.is_type(exp.DType.FLOAT)
             else (53, -1074, 1023, -324, 308)
         )
-        if not decimal_minimum <= number.adjusted() <= decimal_maximum:
+        hexadecimal = _PG_HEX_FLOAT_INPUT.fullmatch(value)
+        if hexadecimal:
+            sign, mantissa, power = hexadecimal.groups()
+            power = power or "0"
+            if len(power.lstrip("+-").lstrip("0")) > 5 or abs(int(power)) > 20000:
+                return None
+            fraction = mantissa.partition(".")[2]
+            shift = int(power) - 4 * len(fraction)
+            numerator = int(mantissa.replace(".", ""), 16) << max(0, shift)
+            denominator = 1 << max(0, -shift)
+            negative = sign == "-"
+        elif _PG_DECIMAL_FLOAT_INPUT.fullmatch(value):
+            try:
+                number = Decimal(value)
+            except InvalidOperation:
+                return None
+            if number and not decimal_minimum <= number.adjusted() <= decimal_maximum:
+                return None
+            numerator, denominator = number.copy_abs().as_integer_ratio()
+            negative = number.is_signed()
+        else:
             return None
-        numerator, denominator = number.copy_abs().as_integer_ratio()
+        if not numerator:
+            return "-0" if negative else "0"
         exponent = numerator.bit_length() - denominator.bit_length()
         if (numerator << max(0, -exponent)) < (denominator << max(0, exponent)):
             exponent -= 1
@@ -496,7 +524,7 @@ class DorisGenerator(MySQLGenerator):
         if not significand or significand.bit_length() + shift - 1 > maximum:
             return None
         integer = significand << shift if shift >= 0 else significand * 5 ** (-shift)
-        decimal = Decimal((int(number.is_signed()), tuple(map(int, str(integer))), min(shift, 0)))
+        decimal = Decimal((int(negative), tuple(map(int, str(integer))), min(shift, 0)))
         return format(decimal, "f").rstrip("0").rstrip(".") if shift < 0 else str(decimal)
 
     def match_sql(self, expression: exp.Match) -> str:

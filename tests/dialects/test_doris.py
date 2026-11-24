@@ -855,7 +855,6 @@ class TestDoris(Validator):
             "1e400",
             "1e-4000",
             "1e99999999999999999999",
-            "0x1.8p+1",
             "NaN",
             "Infinity",
             "1_000",
@@ -1037,6 +1036,43 @@ class TestDoris(Validator):
         self.assertEqual(
             parse_one("(SELECT 0.1::REAL)", read="postgres").sql("doris"),
             "(SELECT CAST(0.1 AS FLOAT))",
+        )
+
+    def test_postgres_array_hex_float_inputs(self):
+        for source, exact, dtype in (
+            ("ARRAY[1::REAL, '0x1.000002p0']", "1.00000011920928955078125", "FLOAT"),
+            ("ARRAY[1::DOUBLE PRECISION, '0X.8']", "0.5", "DOUBLE"),
+            ("ARRAY['-0x.8'::REAL]", "-0.5", "FLOAT"),
+            ("ARRAY['0x1.000001p0'::REAL]", "1", "FLOAT"),
+            ("ARRAY['0x1.0000010000000000000001p0'::REAL]", "1.00000011920928955078125", "FLOAT"),
+            (
+                "ARRAY['0x1.0000000000001p0'::DOUBLE PRECISION]",
+                "1.0000000000000002220446049250313080847263336181640625",
+                "DOUBLE",
+            ),
+            ("ARRAY[(SELECT '0x1.8p+01'::REAL)]", "3", "FLOAT"),
+        ):
+            with self.subTest(source), localcontext() as context:
+                context.prec = 2
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                self.assertIn(f"CAST('{exact}' AS DOUBLE)", target)
+                self.assertIn("AS FLOAT)" if dtype == "FLOAT" else "AS ARRAY<DOUBLE>", target)
+                self.assertEqual(tree, before)
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                self.validate_identity(target)
+
+        for value in ("0x1p128", "0x1p-150", "0x.p0", "0x1p20001", "0x1p" + "9" * 4096):
+            with self.subTest(value):
+                with self.assertRaises(UnsupportedError):
+                    parse_one(f"ARRAY[1::REAL, '{value}']", read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    )
+
+        self.assertEqual(
+            parse_one("'0x1.8p0'::DOUBLE PRECISION", read="postgres").sql("doris"),
+            "CAST('0x1.8p0' AS DOUBLE)",
         )
 
     def test_array_query_constructor(self):
