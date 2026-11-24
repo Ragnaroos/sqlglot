@@ -715,6 +715,99 @@ class TestDoris(Validator):
                 self.assertNotIn("element_type", tree.args)
                 self.assertFalse(tree.sql("doris").startswith("CAST("))
 
+    def test_postgres_array_unknown_inputs(self):
+        for source, expected in (
+            ("ARRAY['1', 2, NULL]", "CAST(ARRAY(CAST('1' AS INT), 2, NULL) AS ARRAY<INT>)"),
+            ("ARRAY[1, '  +01 ']", "CAST(ARRAY(1, CAST('1' AS INT)) AS ARRAY<INT>)"),
+            ("ARRAY['1_000', 1]", "CAST(ARRAY(CAST('1000' AS INT), 1) AS ARRAY<INT>)"),
+            ("ARRAY['-0x80', 1]", "CAST(ARRAY(CAST('-128' AS INT), 1) AS ARRAY<INT>)"),
+            ("ARRAY['0x_7f', 1]", "CAST(ARRAY(CAST('127' AS INT), 1) AS ARRAY<INT>)"),
+            ("ARRAY['0o17', 1]", "CAST(ARRAY(CAST('15' AS INT), 1) AS ARRAY<INT>)"),
+            ("ARRAY['0b101', 1]", "CAST(ARRAY(CAST('5' AS INT), 1) AS ARRAY<INT>)"),
+            (
+                "ARRAY['2147483648', 1::BIGINT]",
+                "CAST(ARRAY(CAST('2147483648' AS BIGINT), CAST(1 AS BIGINT)) AS ARRAY<BIGINT>)",
+            ),
+            (
+                "ARRAY[TRUE, 'yes', 'off']",
+                "CAST(ARRAY(TRUE, CAST('true' AS BOOLEAN), CAST('false' AS BOOLEAN)) AS ARRAY<BOOLEAN>)",
+            ),
+            (
+                "ARRAY[FALSE, (' ON '), 'f']",
+                "CAST(ARRAY(FALSE, CAST('true' AS BOOLEAN), CAST('false' AS BOOLEAN)) AS ARRAY<BOOLEAN>)",
+            ),
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                self.assertEqual(
+                    tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE), expected
+                )
+                self.assertEqual(tree, before)
+                self.validate_identity(expected)
+                self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
+
+        self.assertEqual(
+            parse_one("ARRAY['" + "0" * 5000 + "1', 1]", read="postgres").sql("doris"),
+            "CAST(ARRAY(CAST('1' AS INT), 1) AS ARRAY<INT>)",
+        )
+
+        # An explicit constructor cast supplies the element input type, including
+        # to nested constructors, but not across subqueries or an inner cast.
+        for source, expected in (
+            (
+                "ARRAY['2147483648', 1]::BIGINT[]",
+                "CAST(CAST(ARRAY(CAST('2147483648' AS BIGINT), 1) AS ARRAY<BIGINT>) AS ARRAY<BIGINT>)",
+            ),
+            (
+                "ARRAY['01', 1]::TEXT[]",
+                "CAST(CAST(ARRAY('01', 1) AS ARRAY<STRING>) AS ARRAY<STRING>)",
+            ),
+            (
+                "(ARRAY['0x7fff', 1])::SMALLINT[]",
+                "CAST((CAST(ARRAY(CAST('32767' AS SMALLINT), 1) AS ARRAY<SMALLINT>)) AS ARRAY<SMALLINT>)",
+            ),
+            (
+                "ARRAY[ARRAY['2147483648', 1], ARRAY[2, 3]]::BIGINT[][]",
+                "CAST(CAST(ARRAY(CAST(ARRAY(CAST('2147483648' AS BIGINT), 1) AS ARRAY<BIGINT>), CAST(ARRAY(2, 3) AS ARRAY<BIGINT>)) AS ARRAY<ARRAY<BIGINT>>) AS ARRAY<ARRAY<BIGINT>>)",
+            ),
+            ("ARRAY['1.5', 1]::DECIMAL(10, 2)[]", "CAST(ARRAY('1.5', 1) AS ARRAY<DECIMAL(10, 2)>)"),
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                self.assertEqual(
+                    tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE), expected
+                )
+                self.assertEqual(tree, before)
+                self.validate_identity(expected)
+
+        # Invalid source inputs do not silently become Doris NULLs or rounded integers.
+        for source in (
+            "ARRAY['1__0', 1]",
+            "ARRAY['12.0', 1]",
+            "ARRAY['1e2', 1]",
+            "ARRAY['2147483648', 1]",
+            "ARRAY['32768', 1::SMALLINT]",
+            "ARRAY['9223372036854775808', 1::BIGINT]",
+            "ARRAY['１', 1]",
+            "ARRAY[TRUE, 'o']",
+            "ARRAY[FALSE, 'truth']",
+            "(SELECT ARRAY['2147483648', 1])::BIGINT[]",
+            "(ARRAY['2147483648', 1]::INT[])::BIGINT[]",
+        ):
+            with self.subTest(source):
+                with self.assertRaisesRegex(UnsupportedError, "array input"):
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    )
+
+        for dialect in ("doris", "hive"):
+            self.assertEqual(
+                parse_one("ARRAY('0x7f', 1)", read=dialect).sql("doris"),
+                "ARRAY('0x7f', 1)",
+            )
+
     def test_array_query_constructor(self):
         for source in (
             "SELECT ARRAY(SELECT 1)",

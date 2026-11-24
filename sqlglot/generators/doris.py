@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import typing as t
 
 from sqlglot import exp
@@ -13,6 +14,12 @@ from sqlglot.dialects.dialect import (
 )
 from sqlglot.generators.mysql import MySQLGenerator
 from sqlglot.optimizer.annotate_types import annotate_types
+
+
+_PG_INTEGER_INPUT = re.compile(
+    r"[+-]?(?:[0-9](?:_?[0-9])*|0[xX]_?[0-9a-fA-F](?:_?[0-9a-fA-F])*"
+    r"|0[oO]_?[0-7](?:_?[0-7])*|0[bB]_?[01](?:_?[01])*)"
+)
 
 
 def _lag_lead_sql(self, expression: exp.Lag | exp.Lead) -> str:
@@ -280,6 +287,40 @@ class DorisGenerator(MySQLGenerator):
 
         return aggregate
 
+    def cast_sql(self, expression: exp.Cast, safe_prefix: str | None = None) -> str:
+        value = expression.this.unnest()
+        if (
+            expression.to.is_type(exp.DType.ARRAY)
+            and isinstance(value, exp.Array)
+            and value.args.get("element_type")
+        ):
+            # PG applies the explicit constructor cast to unknown elements,
+            # overriding the constructor's provisional common type.
+            expression = expression.copy()
+            self._array_cast_types(t.cast(exp.Array, expression.this.unnest()), expression.to)
+        return super().cast_sql(expression, safe_prefix=safe_prefix)
+
+    def _array_cast_types(self, array: exp.Array, dtype: exp.DataType) -> None:
+        element = t.cast(exp.DataType, dtype.expressions[0])
+        array.set(
+            "element_type",
+            element.copy()
+            if element.is_type(
+                exp.DType.ARRAY,
+                exp.DType.TEXT,
+                exp.DType.BOOLEAN,
+                exp.DType.SMALLINT,
+                exp.DType.INT,
+                exp.DType.BIGINT,
+            )
+            else None,
+        )
+        if element.is_type(exp.DType.ARRAY):
+            for value in array.expressions:
+                nested = value.unnest()
+                if isinstance(nested, exp.Array):
+                    self._array_cast_types(nested, element)
+
     def array_sql(self, expression: exp.Array) -> str:
         expressions = expression.expressions
         if (
@@ -292,6 +333,10 @@ class DorisGenerator(MySQLGenerator):
         if element_type:
             array = expression.copy()
             array.set("element_type", None)
+            array.set(
+                "expressions",
+                [self._coerce_array_input(value, element_type) for value in expressions],
+            )
             return super().cast_sql(
                 exp.cast(
                     array,
@@ -301,6 +346,43 @@ class DorisGenerator(MySQLGenerator):
                 )
             )
         return self.func("ARRAY", *expressions)
+
+    def _coerce_array_input(self, expression: exp.Expr, dtype: exp.DataType) -> exp.Expr:
+        literal = expression.unnest()
+        if not literal.is_string or dtype.is_type(exp.DType.TEXT):
+            return expression.copy()
+
+        value = literal.to_py().strip(" \t\n\r\f\v")
+        normalized = None
+        bits = {exp.DType.SMALLINT: 16, exp.DType.INT: 32, exp.DType.BIGINT: 64}.get(dtype.this)
+        if bits and _PG_INTEGER_INPUT.fullmatch(value):
+            unsigned = value.lstrip("+-").lower().replace("_", "")
+            base = {"0x": 16, "0o": 8, "0b": 2}.get(unsigned[:2], 10)
+            digits = (unsigned if base == 10 else unsigned[2:]).lstrip("0") or "0"
+            # Discard leading zeros before parsing; even a binary integer needs
+            # at most `bits` digits, avoiding Python's huge decimal input limit.
+            if len(digits) <= bits:
+                number = int(digits, base) * (-1 if value.startswith("-") else 1)
+                if -(2 ** (bits - 1)) <= number < 2 ** (bits - 1):
+                    normalized = str(number)
+        elif dtype.is_type(exp.DType.BOOLEAN) and value:
+            matches = {
+                result
+                for result, inputs in (
+                    ("true", ("true", "yes", "on", "1")),
+                    ("false", ("false", "no", "off", "0")),
+                )
+                if any(word.startswith(value.lower()) for word in inputs)
+            }
+            if len(matches) == 1:
+                normalized = matches.pop()
+
+        if normalized is None:
+            self.unsupported("Doris cannot preserve this PostgreSQL array input conversion")
+        else:
+            literal = literal.copy()
+            literal.set("this", normalized)
+        return exp.cast(literal.copy(), dtype.copy())
 
     def match_sql(self, expression: exp.Match) -> str:
         kind = expression.text("kind")

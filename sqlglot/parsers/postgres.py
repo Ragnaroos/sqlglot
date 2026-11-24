@@ -108,6 +108,10 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
     if any(expression.unnest().is_string for expression in expressions) and not result.is_type(
         exp.DType.UNKNOWN,
         exp.DType.TEXT,
+        exp.DType.SMALLINT,
+        exp.DType.INT,
+        exp.DType.BIGINT,
+        exp.DType.BOOLEAN,
     ):
         return None
     return exp.DataType.build(exp.DType.TEXT) if result.is_type(exp.DType.UNKNOWN) else result
