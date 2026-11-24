@@ -5,6 +5,61 @@ from tests.dialects.test_dialect import Validator
 class TestDoris(Validator):
     dialect = "doris"
 
+    def test_null_ordering(self):
+        for source, expected in (
+            ("SELECT a FROM t ORDER BY 1", "SELECT a FROM t ORDER BY 1 NULLS LAST"),
+            ("SELECT a FROM t ORDER BY 1 DESC", "SELECT a FROM t ORDER BY 1 DESC NULLS FIRST"),
+            ("SELECT a FROM t ORDER BY a", "SELECT a FROM t ORDER BY a NULLS LAST"),
+            ("SELECT a FROM t ORDER BY a DESC", "SELECT a FROM t ORDER BY a DESC NULLS FIRST"),
+            ("SELECT a FROM t ORDER BY a ASC NULLS FIRST", "SELECT a FROM t ORDER BY a ASC"),
+            ("SELECT a FROM t ORDER BY a DESC NULLS LAST", "SELECT a FROM t ORDER BY a DESC"),
+            (
+                "SELECT a FROM t ORDER BY a ASC NULLS LAST",
+                "SELECT a FROM t ORDER BY a ASC NULLS LAST",
+            ),
+            (
+                "SELECT a FROM t ORDER BY a DESC NULLS FIRST",
+                "SELECT a FROM t ORDER BY a DESC NULLS FIRST",
+            ),
+            (
+                "SELECT a + 1 AS b FROM t ORDER BY b",
+                "SELECT a + 1 AS b FROM t ORDER BY b NULLS LAST",
+            ),
+            (
+                "SELECT a, b FROM t ORDER BY 1, 2 DESC",
+                "SELECT a, b FROM t ORDER BY 1 NULLS LAST, 2 DESC NULLS FIRST",
+            ),
+            (
+                "SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t",
+                "SELECT ROW_NUMBER() OVER (ORDER BY a NULLS LAST) FROM t",
+            ),
+            (
+                "SELECT SUM(a) OVER (ORDER BY a ROWS UNBOUNDED PRECEDING) FROM t",
+                "SELECT SUM(a) OVER (ORDER BY a NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+            ),
+            (
+                "SELECT SUM(a) OVER (ORDER BY a RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+                "SELECT SUM(a) OVER (ORDER BY a NULLS LAST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+            ),
+        ):
+            with self.subTest(source):
+                self.validate_all(expected, read={"postgres": source}, write={"doris": expected})
+                self.assertEqual(
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    ),
+                    expected,
+                )
+
+        self.validate_all(
+            "SELECT a FROM t ORDER BY a NULLS LAST",
+            write={"mysql": "SELECT a FROM t ORDER BY CASE WHEN a IS NULL THEN 1 ELSE 0 END, a"},
+        )
+        with self.assertRaisesRegex(UnsupportedError, "positional ordering"):
+            parse_one("SELECT a FROM t ORDER BY 1", read="postgres").sql(
+                "mysql", unsupported_level=ErrorLevel.RAISE
+            )
+
     def test_array_constructor(self):
         for source, expected in (
             ("SELECT ARRAY[1, 2]", "SELECT ARRAY(1, 2)"),
@@ -140,33 +195,36 @@ class TestDoris(Validator):
             },
         )
         self.validate_all(
-            "SELECT LAG(1, 1, NULL) OVER (ORDER BY 1)",
+            "SELECT LAG(1, 1, NULL) OVER (ORDER BY 1 NULLS LAST)",
             read={
-                "doris": "SELECT LAG(1, 1, NULL) OVER (ORDER BY 1)",
+                "doris": "SELECT LAG(1, 1, NULL) OVER (ORDER BY 1 NULLS LAST)",
                 "postgres": "SELECT LAG(1) OVER (ORDER BY 1)",
             },
         )
         self.validate_all(
-            "SELECT LAG(1, 2, NULL) OVER (ORDER BY 1)",
+            "SELECT LAG(1, 2, NULL) OVER (ORDER BY 1 NULLS LAST)",
             read={
-                "doris": "SELECT LAG(1, 2, NULL) OVER (ORDER BY 1)",
+                "doris": "SELECT LAG(1, 2, NULL) OVER (ORDER BY 1 NULLS LAST)",
                 "postgres": "SELECT LAG(1, 2) OVER (ORDER BY 1)",
             },
         )
         self.validate_all(
-            "SELECT LEAD(1, 1, NULL) OVER (ORDER BY 1)",
+            "SELECT LEAD(1, 1, NULL) OVER (ORDER BY 1 NULLS LAST)",
             read={
-                "doris": "SELECT LEAD(1, 1, NULL) OVER (ORDER BY 1)",
+                "doris": "SELECT LEAD(1, 1, NULL) OVER (ORDER BY 1 NULLS LAST)",
                 "postgres": "SELECT LEAD(1) OVER (ORDER BY 1)",
             },
         )
         self.validate_all(
-            "SELECT LEAD(1, 2, NULL) OVER (ORDER BY 1)",
+            "SELECT LEAD(1, 2, NULL) OVER (ORDER BY 1 NULLS LAST)",
             read={
-                "doris": "SELECT LEAD(1, 2, NULL) OVER (ORDER BY 1)",
+                "doris": "SELECT LEAD(1, 2, NULL) OVER (ORDER BY 1 NULLS LAST)",
                 "postgres": "SELECT LEAD(1, 2) OVER (ORDER BY 1)",
             },
         )
+        for function in ("LAG", "LEAD"):
+            for offset in (1, 2):
+                self.validate_identity(f"SELECT {function}(1, {offset}, NULL) OVER (ORDER BY 1)")
         self.validate_identity("""JSON_TYPE('{"foo": "1" }', '$.foo')""")
 
         self.validate_identity("L2_DISTANCE(x, y)")
