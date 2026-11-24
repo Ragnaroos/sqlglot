@@ -11,6 +11,30 @@ class TestPostgres(Validator):
     maxDiff = None
     dialect = "postgres"
 
+    def test_every(self):
+        for argument in ("b", "NOT b", "DISTINCT b", "CAST(NULL AS BOOLEAN)"):
+            source = f"SELECT EVERY({argument}) AS v FROM t"
+            expected = f"SELECT BOOL_AND({argument}) AS v FROM t"
+            with self.subTest(source):
+                tree = self.validate_identity(source, expected)
+                self.assertIsInstance(tree.expressions[0].this, exp.LogicalAnd)
+                self.assertEqual(tree, parse_one(expected, read="postgres"))
+                self.assertTrue(annotate_types(tree).expressions[0].is_type(exp.DType.BOOLEAN))
+                self.validate_all(
+                    source,
+                    write={
+                        "postgres": expected,
+                        "mysql": f"SELECT MIN({argument.replace('BOOLEAN', 'SIGNED')}) AS v FROM t",
+                        "bigquery": f"SELECT LOGICAL_AND({argument.replace('BOOLEAN', 'BOOL')}) AS v FROM t",
+                        "spark": expected,
+                        "snowflake": f"SELECT BOOLAND_AGG({argument}) AS v FROM t",
+                    },
+                )
+
+        self.validate_identity("SELECT app.every(b) FROM t")
+        self.validate_identity("SELECT CUSTOM_EVERY(b) FROM t")
+        self.assertIsInstance(parse_one("EVERY(b)", read="mysql"), exp.Anonymous)
+
     def test_array_agg_empty_input_contract(self):
         for sql, mysql_sql in (
             ("SELECT ARRAY_AGG(a) FROM t", "SELECT GROUP_CONCAT(a) FROM t"),

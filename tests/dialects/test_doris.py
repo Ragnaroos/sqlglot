@@ -5,6 +5,37 @@ from tests.dialects.test_dialect import Validator
 class TestDoris(Validator):
     dialect = "doris"
 
+    def test_boolean_every(self):
+        self.validate_all(
+            "SELECT MIN(b) AS v FROM t",
+            read={
+                "postgres": "SELECT EVERY(b) AS v FROM t",
+                "bigquery": "SELECT LOGICAL_AND(b) AS v FROM t",
+                "spark": "SELECT BOOL_AND(b) AS v FROM t",
+                "snowflake": "SELECT BOOLAND_AGG(b) AS v FROM t",
+            },
+            write={"doris": "SELECT MIN(b) AS v FROM t"},
+        )
+        for source, expected in (
+            ("SELECT EVERY(NOT b) AS v FROM t", "SELECT MIN(NOT b) AS v FROM t"),
+            ("SELECT EVERY(DISTINCT b) FROM t", "SELECT MIN(DISTINCT b) FROM t"),
+            (
+                "SELECT EVERY(CAST(NULL AS BOOLEAN)) FROM t WHERE FALSE",
+                "SELECT MIN(CAST(NULL AS BOOLEAN)) FROM t WHERE FALSE",
+            ),
+            (
+                "SELECT g, EVERY(b) AS v FROM t GROUP BY g HAVING EVERY(b) ORDER BY g",
+                "SELECT g, MIN(b) AS v FROM t GROUP BY g HAVING MIN(b) ORDER BY g NULLS LAST",
+            ),
+            (
+                "SELECT (SELECT EVERY(b) FROM t) AS v",
+                "SELECT (SELECT MIN(b) FROM t) AS v",
+            ),
+        ):
+            with self.subTest(source):
+                self.validate_all(expected, read={"postgres": source}, write={"doris": expected})
+                self.validate_identity(expected)
+
     def test_aggregate_filter(self):
         for function in ("SUM", "AVG", "MIN", "MAX", "COUNT", "ANY_VALUE"):
             for argument in ("a", "DISTINCT a"):
