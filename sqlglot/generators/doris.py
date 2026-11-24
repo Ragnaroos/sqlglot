@@ -25,15 +25,46 @@ def _lag_lead_sql(self, expression: exp.Lag | exp.Lead) -> str:
 class DorisGenerator(MySQLGenerator):
     def arrayagg_sql(self, expression: exp.ArrayAgg) -> str:
         context = expression.find_ancestor(exp.Window, exp.Filter, exp.WithinGroup, exp.Select)
-        if (
-            isinstance(context, (exp.Window, exp.Filter, exp.WithinGroup))
-            or isinstance(expression.this, exp.Order)
-            or expression.args.get("nulls_excluded")
-        ):
+        if isinstance(context, (exp.Window, exp.Filter, exp.WithinGroup)):
             return self.func("COLLECT_LIST", expression.this)
-        aggregate = self.func("ARRAY_AGG", expression.this)
+
+        this = expression.this
+        order = this if isinstance(this, exp.Order) else None
+        if order:
+            this = order.this
+            if isinstance(this, exp.Distinct) and len(this.expressions) != 1:
+                return self.func("COLLECT_LIST", expression.this)
+            value = this.expressions[0] if isinstance(this, exp.Distinct) else this
+            if (
+                len(order.expressions) != 1
+                or order.expressions[0].this != value
+                or value.find(exp.Query, exp.Collate)
+                or any(not isinstance(node, exp.Cast) for node in value.find_all(exp.Func))
+            ):
+                return self.func("COLLECT_LIST", expression.this)
+
+        if expression.args.get("nulls_excluded"):
+            return self.func("COLLECT_LIST", expression.this)
+
+        aggregate = self.func("ARRAY_AGG", this)
+        if order:
+            # Slice the NULL prefix; Doris rejects lambda arguments in HAVING.
+            ordered = order.expressions[0]
+            all_values = exp.ArrayAgg(this=this.copy())
+            nonnull_values = exp.ArrayAgg(this=this.copy(), nulls_excluded=True)
+            null_count = exp.ArraySize(this=all_values) - exp.ArraySize(this=nonnull_values.copy())
+            nulls = self.func(
+                "ARRAY_SLICE", self.func("ARRAY_SORT", aggregate), exp.Literal.number(1), null_count
+            )
+            nonnull = self.func(
+                "ARRAY_REVERSE_SORT" if ordered.args.get("desc") else "ARRAY_SORT", nonnull_values
+            )
+            parts = (nulls, nonnull) if ordered.args.get("nulls_first") else (nonnull, nulls)
+            aggregate = self.func("ARRAY_CONCAT", *parts)
+
         if expression.args.get("null_on_empty"):
             return self.func("NULLIF", aggregate, self.func("ARRAY"))
+
         return aggregate
 
     def array_sql(self, expression: exp.Array) -> str:
@@ -52,6 +83,7 @@ class DorisGenerator(MySQLGenerator):
         analyzer = self.sql(expression, "analyzer")
         return f"{sql} USING ANALYZER {analyzer}" if analyzer else sql
 
+    ARRAY_SIZE_NAME = "ARRAY_SIZE"
     LAST_DAY_SUPPORTS_DATE_PART = False
     NULL_ORDERING_SUPPORTED = True
     SUPPORTS_ALTER_COLUMN_NULLABILITY = False
