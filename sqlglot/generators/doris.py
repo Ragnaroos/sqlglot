@@ -5,6 +5,7 @@ import typing as t
 from sqlglot import exp
 from sqlglot.dialects.dialect import (
     approx_count_distinct_sql,
+    no_filter_sql,
     property_sql,
     rename_func,
     time_format,
@@ -23,6 +24,32 @@ def _lag_lead_sql(self, expression: exp.Lag | exp.Lead) -> str:
 
 
 class DorisGenerator(MySQLGenerator):
+    def filter_sql(self, expression: exp.Filter) -> str:
+        aggregate = expression.this
+        if (
+            type(aggregate) not in (exp.Sum, exp.Avg, exp.Min, exp.Max, exp.Count, exp.AnyValue)
+            or isinstance(expression.find_ancestor(exp.Window, exp.Select), exp.Window)
+            or isinstance(aggregate.this, exp.Order)
+            or aggregate.expressions
+            or any(column.is_star for column in aggregate.find_all(exp.Column))
+            or (isinstance(aggregate.this, exp.Distinct) and len(aggregate.this.expressions) != 1)
+        ):
+            return super().filter_sql(expression)
+
+        if isinstance(aggregate, exp.Count) and (aggregate.this is None or aggregate.this.is_star):
+            aggregate = aggregate.copy()
+            aggregate.set(
+                "this",
+                exp.If(
+                    this=expression.expression.this.copy(),
+                    true=exp.Literal.number(1),
+                    false=exp.null(),
+                ),
+            )
+            return self.sql(aggregate)
+
+        return no_filter_sql(self, expression.copy())
+
     def arrayagg_sql(self, expression: exp.ArrayAgg) -> str:
         context = expression.find_ancestor(exp.Window, exp.Filter, exp.WithinGroup, exp.Select)
         if isinstance(context, (exp.Window, exp.Filter, exp.WithinGroup)):
