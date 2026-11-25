@@ -5,6 +5,79 @@ from tests.dialects.test_dialect import Validator
 class TestDoris(Validator):
     dialect = "doris"
 
+    def test_aggregate_filter(self):
+        for function in ("SUM", "AVG", "MIN", "MAX", "COUNT", "ANY_VALUE"):
+            for argument in ("a", "DISTINCT a"):
+                conditional = "IF(p, a, NULL)"
+                if argument.startswith("DISTINCT"):
+                    conditional = f"DISTINCT {conditional}"
+                source = f"SELECT {function}({argument}) FILTER(WHERE p) AS v FROM t"
+                expected = f"SELECT {function}({conditional}) AS v FROM t"
+                with self.subTest(source):
+                    self.validate_all(
+                        expected, read={"postgres": source}, write={"doris": expected}
+                    )
+                    tree = parse_one(source, read="postgres")
+                    original = tree.copy()
+                    self.assertEqual(
+                        tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE), expected
+                    )
+                    self.assertEqual(tree, original)
+                    self.validate_identity(expected)
+
+        for source, expected in (
+            ("SELECT COUNT(*) FILTER(WHERE p) FROM t", "SELECT COUNT(IF(p, 1, NULL)) FROM t"),
+            ("SELECT COUNT(*) FILTER(WHERE NULL) FROM t", "SELECT COUNT(IF(NULL, 1, NULL)) FROM t"),
+            (
+                "SELECT COUNT(*) FILTER(WHERE TRUE) FROM t WHERE FALSE",
+                "SELECT COUNT(IF(TRUE, 1, NULL)) FROM t WHERE FALSE",
+            ),
+            ("SELECT SUM(a) FILTER(WHERE FALSE) FROM t", "SELECT SUM(IF(FALSE, a, NULL)) FROM t"),
+            (
+                "SELECT SUM(a) FILTER(WHERE p) FROM t HAVING COUNT(*) FILTER(WHERE p)>0",
+                "SELECT SUM(IF(p, a, NULL)) FROM t HAVING COUNT(IF(p, 1, NULL)) > 0",
+            ),
+            (
+                "SELECT g, MIN(a) FILTER(WHERE p) FROM t GROUP BY g ORDER BY g",
+                "SELECT g, MIN(IF(p, a, NULL)) FROM t GROUP BY g ORDER BY g NULLS LAST",
+            ),
+            (
+                "SELECT (SELECT MIN(a) FILTER(WHERE p) FROM t) AS v",
+                "SELECT (SELECT MIN(IF(p, a, NULL)) FROM t) AS v",
+            ),
+        ):
+            with self.subTest(source):
+                self.validate_all(expected, read={"postgres": source}, write={"doris": expected})
+                self.validate_identity(expected)
+
+    def test_aggregate_filter_exclusions(self):
+        for source, expected in (
+            (
+                "SELECT COUNT(t.*) FILTER(WHERE p) FROM t",
+                "SELECT COUNT(t.*) FILTER(WHERE p) FROM t",
+            ),
+            (
+                "SELECT ARRAY_AGG(a) FILTER(WHERE p) FROM t",
+                "SELECT COLLECT_LIST(a) FILTER(WHERE p) FROM t",
+            ),
+            ("SELECT my_agg(a) FILTER(WHERE p) FROM t", "SELECT MY_AGG(a) FILTER(WHERE p) FROM t"),
+            (
+                "SELECT SUM(a) FILTER(WHERE p) OVER () FROM t",
+                "SELECT SUM(a) FILTER(WHERE p) OVER () FROM t",
+            ),
+            (
+                "SELECT SUM(a ORDER BY b) FILTER(WHERE p) FROM t",
+                "SELECT SUM(a ORDER BY b NULLS LAST) FILTER(WHERE p) FROM t",
+            ),
+        ):
+            with self.subTest(source):
+                self.assertEqual(
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    ),
+                    expected,
+                )
+
     def test_array_agg_nulls_and_empty_input(self):
         for source, expected in (
             ("SELECT ARRAY_AGG(a) FROM t", "SELECT NULLIF(ARRAY_AGG(a), ARRAY()) FROM t"),
