@@ -23,6 +23,71 @@ if t.TYPE_CHECKING:
 SIMPLE_INTERVAL_RE = re.compile(r"\s*(?:[+-]?\s*[0-9]+(?:\.[0-9]*)?|\.[0-9]+)\s*[a-zA-Z]+\s*")
 
 
+def _parse_text_array_literal(value: str) -> exp.Array | None:
+    whitespace = " \t\r\n\v\f"
+    value = value.strip(whitespace)
+    if not value.startswith("{") or not value.endswith("}"):
+        return None
+    end = len(value) - 1
+    i = 1
+    elements = []
+    while i < end and value[i] in whitespace:
+        i += 1
+    if i == end:
+        return exp.Array(expressions=[])
+
+    while i < end:
+        quoted = value[i] == '"'
+        escaped = False
+        chars: list[tuple[str, bool]] = []
+        if quoted:
+            i += 1
+        while i < end:
+            char = value[i]
+            if char == "\\":
+                i += 1
+                if i == end:
+                    return None
+                chars.append((value[i], True))
+                escaped = True
+            elif quoted and char == '"':
+                i += 1
+                break
+            elif not quoted and char == ",":
+                break
+            elif not quoted and char in '{}"':
+                return None
+            else:
+                chars.append((char, False))
+            i += 1
+        else:
+            if quoted:
+                return None
+
+        if not quoted:
+            while chars and chars[-1][0] in whitespace and not chars[-1][1]:
+                chars.pop()
+            if not chars:
+                return None
+        text = "".join(char for char, _ in chars)
+        # Unquoted, unescaped NULL is part of PostgreSQL's array input grammar.
+        elements.append(
+            exp.null()
+            if not quoted and not escaped and text.upper() == "NULL"
+            else exp.Literal.string(text)
+        )
+        while i < end and value[i] in whitespace:
+            i += 1
+        if i == end:
+            return exp.Array(expressions=elements, element_type=exp.DataType.build(exp.DType.TEXT))
+        if value[i] != ",":
+            return None
+        i += 1
+        while i < end and value[i] in whitespace:
+            i += 1
+    return None
+
+
 def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
     # Resolve only types established by the source expression. PostgreSQL's unknown
     # literals become TEXT only when no known input type is present. This is type
@@ -574,6 +639,20 @@ class PostgresParser(parser.Parser):
             if dtype:
                 expression.set("element_type", dtype)
         return expression
+
+    def build_cast(self, strict: bool, **kwargs) -> exp.Expr:
+        result = super().build_cast(strict, **kwargs)
+        if (
+            type(result) is exp.Cast
+            and result.this.is_string
+            and result.to.is_type(exp.DType.ARRAY)
+            and len(result.to.expressions) == 1
+            and result.to.expressions[0].is_type(exp.DType.TEXT)
+        ):
+            array = _parse_text_array_literal(result.this.name)
+            if array is not None:
+                result.set("this", array)
+        return result
 
     def _parse_window(self, this: exp.Expr | None, alias: bool = False) -> exp.Expr | None:
         result = super()._parse_window(this, alias=alias)
