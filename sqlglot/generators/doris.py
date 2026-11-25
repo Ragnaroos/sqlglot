@@ -339,6 +339,11 @@ class DorisGenerator(MySQLGenerator):
             self.unsupported("Doris does not support ARRAY subquery constructors")
         element_type = expression.args.get("element_type")
         if element_type:
+            leaf_type = element_type
+            while leaf_type.is_type(exp.DType.ARRAY):
+                leaf_type = leaf_type.expressions[0]
+            if leaf_type.is_type(exp.DType.DECIMAL):
+                return self._integer_numeric_array_sql(expression)
             array = expression.copy()
             array.set("element_type", None)
             inputs = [self._coerce_array_input(value, element_type) for value in expressions]
@@ -364,6 +369,85 @@ class DorisGenerator(MySQLGenerator):
                 )
             )
         return self.func("ARRAY", *expressions)
+
+    def _integer_numeric_array_sql(self, expression: exp.Array) -> str:
+        # The PG hint establishes NUMERIC, not a fabricated source typmod.
+        # Only finite integer domains with a provable target width are portable.
+        widths = {exp.DType.SMALLINT: 5, exp.DType.INT: 10, exp.DType.BIGINT: 19}
+
+        def integer_text(value: exp.Expr) -> str | None:
+            literal = value.this if isinstance(value, exp.Neg) else value
+            if literal.is_number and re.fullmatch(r"[0-9]+", literal.name):
+                digits = literal.name.lstrip("0") or "0"
+                return ("-" if isinstance(value, exp.Neg) else "") + digits
+            return None
+
+        def width(value: exp.Expr) -> int | None:
+            value = value.unnest() if isinstance(value, exp.Paren) else value
+            if isinstance(value, exp.Array):
+                children = [width(child) for child in value.expressions]
+                if children and all(child is not None for child in children):
+                    return max(t.cast(list[int], children))
+            elif (digits := integer_text(value)) is not None:
+                return len(digits.lstrip("-"))
+            elif type(value) is exp.Cast:
+                return widths.get(value.to.this)
+            elif (
+                value.is_leaf()
+                and not isinstance(value, exp.Func)
+                and annotate_types(
+                    exp.Coalesce(this=value.copy(), expressions=[exp.Literal.number(1)]),
+                    dialect="postgres",
+                ).is_type(exp.DType.INT)
+            ):
+                # Unknown leaf type, not a precomputed NULL result: preserve the
+                # expression and let the runtime CAST handle its value.
+                return 1
+            return None
+
+        precision = width(expression)
+        if precision is None or precision > 76:
+            self.unsupported("Doris cannot preserve this PostgreSQL NUMERIC array domain")
+            return self.func("ARRAY", *expression.expressions)
+        dtype = exp.DataType(
+            this=exp.DType.DECIMAL,
+            expressions=[
+                exp.DataTypeParam(this=exp.Literal.number(precision)),
+                exp.DataTypeParam(this=exp.Literal.number(0)),
+            ],
+        )
+
+        def build(array: exp.Array) -> exp.Expr:
+            inputs = []
+            for value in array.expressions:
+                literal = value.unnest() if isinstance(value, exp.Paren) else value
+                if isinstance(literal, exp.Array):
+                    inputs.append(build(literal))
+                elif (digits := integer_text(literal)) is not None:
+                    inputs.append(exp.Literal.string(digits))
+                else:
+                    inputs.append(exp.cast(value.copy(), exp.DType.TEXT))
+            return exp.Array(expressions=inputs)
+
+        def convert(value: exp.Expr, element: exp.DataType, depth: int = 0) -> exp.Expr:
+            # A constant ARRAY CAST can round Decimal through DOUBLE in Doris's
+            # frontend. Nested Decimal constructors can also narrow to Decimal128.
+            # Construct nested text inputs first, then parse inside runtime lambdas.
+            parameter = exp.to_identifier(
+                "_pg_numeric_input" if not depth else f"_pg_numeric_input_{depth}"
+            )
+            return exp.func(
+                "ARRAY_MAP",
+                exp.Lambda(
+                    this=convert(parameter, element.expressions[0], depth + 1)
+                    if element.is_type(exp.DType.ARRAY)
+                    else exp.cast(parameter, dtype.copy()),
+                    expressions=[parameter],
+                ),
+                value,
+            )
+
+        return self.sql(convert(build(expression), expression.args["element_type"]))
 
     def _coerce_array_input(self, expression: exp.Expr, dtype: exp.DataType) -> exp.Expr:
         literal = expression

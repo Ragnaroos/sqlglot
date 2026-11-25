@@ -710,12 +710,67 @@ class TestDoris(Validator):
             "ARRAY[x, NULL]",
             "ARRAY[:x, NULL]",
             "ARRAY[1.25, 2]",
-            "ARRAY[9223372036854775808]",
         ):
             with self.subTest(source):
                 tree = parse_one(source, read="postgres")
                 self.assertNotIn("element_type", tree.args)
                 self.assertFalse(tree.sql("doris").startswith("CAST("))
+
+    def test_postgres_integer_numeric_arrays(self):
+        for number in (
+            "9223372036854775808",
+            "-9223372036854775809",
+            "18446744073709551616",
+            "9" * 38,
+            "123456789012345678901234567890123456789",
+            "-" + "9" * 76,
+        ):
+            with self.subTest(number):
+                source = f"ARRAY[({number}), NULL, CAST(x AS BIGINT), {number}]"
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                precision = len(number.lstrip("-"))
+                expected = (
+                    "ARRAY_MAP(_pg_numeric_input -> CAST(_pg_numeric_input AS "
+                    f"DECIMAL({precision}, 0)), ARRAY('{number}', CAST(NULL AS STRING), "
+                    f"CAST(CAST(x AS BIGINT) AS STRING), '{number}'))"
+                )
+                self.assertEqual(tree.sql("doris", copy=False), expected)
+                self.assertEqual(tree, before)
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
+                self.assertIn(number, tree.sql("spark"))
+                self.validate_identity(expected)
+
+        self.assertEqual(
+            parse_one("ARRAY[ARRAY[9223372036854775808, NULL], ARRAY[1, 2]]", read="postgres").sql(
+                "doris"
+            ),
+            "ARRAY_MAP(_pg_numeric_input -> ARRAY_MAP(_pg_numeric_input_1 -> "
+            "CAST(_pg_numeric_input_1 AS DECIMAL(19, 0)), _pg_numeric_input), "
+            "ARRAY(ARRAY('9223372036854775808', CAST(NULL AS STRING)), ARRAY('1', '2')))",
+        )
+        for source in (
+            "ARRAY[" + "9" * 77 + "]",
+            "ARRAY[" + "9" * 5000 + "]",
+            "ARRAY[9223372036854775808, (SELECT x::INT FROM t)]",
+        ):
+            with self.subTest(source[:80]), self.assertRaises(UnsupportedError):
+                parse_one(source, read="postgres").sql("doris", unsupported_level=ErrorLevel.RAISE)
+
+        # Mixed unknown strings and general NUMERIC casts have no proven integer
+        # domain; the constructor hint must not guess one or change scalar CASTs.
+        for source in (
+            "ARRAY[9223372036854775808, '1.5']",
+            "ARRAY[9223372036854775808, 1.5]",
+            "ARRAY[9223372036854775808, x]",
+            "ARRAY[CAST(x AS NUMERIC), 1]",
+        ):
+            self.assertNotIn("element_type", parse_one(source, read="postgres").args)
+        self.assertEqual(
+            parse_one("SELECT 9223372036854775808", read="postgres").sql("doris"),
+            "SELECT 9223372036854775808",
+        )
 
     def test_postgres_array_unknown_inputs(self):
         for source, expected in (
