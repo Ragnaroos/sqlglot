@@ -343,7 +343,7 @@ class DorisGenerator(MySQLGenerator):
             while leaf_type.is_type(exp.DType.ARRAY):
                 leaf_type = leaf_type.expressions[0]
             if leaf_type.is_type(exp.DType.DECIMAL):
-                return self._integer_numeric_array_sql(expression)
+                return self._bounded_numeric_array_sql(expression)
             array = expression.copy()
             array.set("element_type", None)
             inputs = [self._coerce_array_input(value, element_type) for value in expressions]
@@ -370,31 +370,53 @@ class DorisGenerator(MySQLGenerator):
             )
         return self.func("ARRAY", *expressions)
 
-    def _integer_numeric_array_sql(self, expression: exp.Array) -> str:
+    def _bounded_numeric_array_sql(self, expression: exp.Array) -> str:
         # The PG hint establishes NUMERIC, not a fabricated source typmod.
-        # Only finite integer domains with a provable target width are portable.
+        # Only finite domains with a provable target width/scale are portable.
         widths = {exp.DType.SMALLINT: 5, exp.DType.INT: 10, exp.DType.BIGINT: 19}
 
-        def integer_text(value: exp.Expr) -> str | None:
+        def number_input(value: exp.Expr) -> tuple[str, int, int] | None:
             literal = value.this if isinstance(value, exp.Neg) else value
-            if literal.is_number and re.fullmatch(r"[0-9]+", literal.name):
-                digits = literal.name.lstrip("0") or "0"
-                return ("-" if isinstance(value, exp.Neg) else "") + digits
+            if literal.is_number and len(literal.name) <= 4096:
+                try:
+                    number = Decimal(literal.name)
+                except InvalidOperation:
+                    return None
+                if not number.is_finite():
+                    return None
+                _, digits, exponent = number.as_tuple()
+                exponent = t.cast(int, exponent)
+                if abs(exponent) > 10000:
+                    return None
+                scale = max(-exponent, 0)
+                integers = max(len(digits) + exponent, 0) if number else 0
+                if integers + scale <= 76:
+                    return (
+                        ("-" if isinstance(value, exp.Neg) else "") + format(number, "f"),
+                        integers,
+                        scale,
+                    )
             return None
 
-        def width(value: exp.Expr) -> int | None:
+        def bounds(value: exp.Expr) -> tuple[int, int | None] | None:
             value = value.unnest() if isinstance(value, exp.Paren) else value
             if isinstance(value, exp.Array):
-                children = [width(child) for child in value.expressions]
+                children = [bounds(child) for child in value.expressions]
                 if children and all(child is not None for child in children):
-                    return max(t.cast(list[int], children))
-            elif (digits := integer_text(value)) is not None:
-                return len(digits.lstrip("-"))
+                    known = t.cast(list[tuple[int, int | None]], children)
+                    scales = {scale for _, scale in known if scale is not None}
+                    # PG retains per-element NUMERIC display scales. A fixed
+                    # Decimal array must not silently add observable trailing zeros.
+                    if len(scales) <= 1:
+                        return max(width for width, _ in known), next(iter(scales), None)
+            elif (number := number_input(value)) is not None:
+                return number[1], number[2]
             elif type(value) is exp.Cast:
-                return widths.get(value.to.this)
+                if (width := widths.get(value.to.this)) is not None:
+                    return width, 0
             elif (
                 value.is_leaf()
-                and not isinstance(value, exp.Func)
+                and not isinstance(value, (exp.Func, exp.Literal))
                 and annotate_types(
                     exp.Coalesce(this=value.copy(), expressions=[exp.Literal.number(1)]),
                     dialect="postgres",
@@ -402,18 +424,21 @@ class DorisGenerator(MySQLGenerator):
             ):
                 # Unknown leaf type, not a precomputed NULL result: preserve the
                 # expression and let the runtime CAST handle its value.
-                return 1
+                return 0, None
             return None
 
-        precision = width(expression)
-        if precision is None or precision > 76:
+        resolved = bounds(expression)
+        integers, scale = resolved or (77, 0)
+        scale = scale or 0
+        precision = max(integers + scale, 1)
+        if precision > 76:
             self.unsupported("Doris cannot preserve this PostgreSQL NUMERIC array domain")
             return self.func("ARRAY", *expression.expressions)
         dtype = exp.DataType(
             this=exp.DType.DECIMAL,
             expressions=[
                 exp.DataTypeParam(this=exp.Literal.number(precision)),
-                exp.DataTypeParam(this=exp.Literal.number(0)),
+                exp.DataTypeParam(this=exp.Literal.number(scale)),
             ],
         )
 
@@ -423,8 +448,8 @@ class DorisGenerator(MySQLGenerator):
                 literal = value.unnest() if isinstance(value, exp.Paren) else value
                 if isinstance(literal, exp.Array):
                     inputs.append(build(literal))
-                elif (digits := integer_text(literal)) is not None:
-                    inputs.append(exp.Literal.string(digits))
+                elif (number := number_input(literal)) is not None:
+                    inputs.append(exp.Literal.string(number[0]))
                 else:
                     inputs.append(exp.cast(value.copy(), exp.DType.TEXT))
             return exp.Array(expressions=inputs)

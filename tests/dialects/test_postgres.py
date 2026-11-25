@@ -22,6 +22,8 @@ class TestPostgres(Validator):
             ("ARRAY[-9223372036854775808, 9223372036854775807]", "BIGINT"),
             ("ARRAY[9223372036854775808, NULL, 1]", "DECIMAL"),
             ("ARRAY[-9223372036854775809, CAST(1 AS BIGINT)]", "DECIMAL"),
+            ("ARRAY[1.25, NULL, -2.00]", "DECIMAL"),
+            ("ARRAY[1E40, 1E-40]", "DECIMAL"),
             ("ARRAY[ARRAY[9223372036854775808], ARRAY[1]]", "ARRAY<DECIMAL>"),
             ("ARRAY[NULL]", "TEXT"),
             ("ARRAY['a', 'b']", "TEXT"),

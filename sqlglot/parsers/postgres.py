@@ -53,6 +53,8 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
             if -(2**63) <= value < 2**63:
                 return exp.DataType.build(exp.DType.BIGINT)
             return exp.DataType.build(exp.DType.DECIMAL)
+        if literal.is_number:
+            return exp.DataType.build(exp.DType.DECIMAL)
         if isinstance(expression, exp.Cast):
             dtype = expression.to
             if dtype and dtype.is_type(*numeric_types, exp.DType.TEXT, exp.DType.BOOLEAN):
