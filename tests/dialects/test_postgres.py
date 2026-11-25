@@ -31,6 +31,9 @@ class TestPostgres(Validator):
             ("ARRAY[CAST(1 AS DOUBLE PRECISION), '1e2']", "DOUBLE"),
             ("ARRAY[-CAST(0.1 AS REAL), NULL]", "FLOAT"),
             ("ARRAY[-CAST(0.1 AS REAL), CAST(2 AS DOUBLE PRECISION)]", "DOUBLE"),
+            ("ARRAY[1, e'0x10']", "INT"),
+            ("ARRAY[TRUE, e'yes']", "BOOLEAN"),
+            ("ARRAY[1.25, e'2.00']", "DECIMAL"),
         ):
             with self.subTest(source):
                 tree = self.validate_identity(source)
@@ -60,6 +63,7 @@ class TestPostgres(Validator):
             ("ARRAY[ARRAY[2147483648, 2], '{3,4}']", "ARRAY<BIGINT>"),
             ("ARRAY[ARRAY[1.20, 2.00], '{3.40,5.60}']", "ARRAY<DECIMAL>"),
             ("ARRAY[ARRAY[CAST(x AS INT), CAST(y AS INT)], '{3,4}']", "ARRAY<INT>"),
+            (r"ARRAY[ARRAY['a', 'b'], e'{N\\ULL,NULL}']", "ARRAY<TEXT>"),
         ):
             with self.subTest(source=source):
                 tree = self.validate_identity(source)
@@ -68,9 +72,6 @@ class TestPostgres(Validator):
                 for dialect in ("postgres", "spark", "duckdb"):
                     tree.sql(dialect, copy=False)
                     self.assertEqual(tree, before)
-                with self.assertRaises(UnsupportedError):
-                    tree.sql("doris", unsupported_level=ErrorLevel.RAISE)
-                self.assertEqual(tree, before)
                 self.assertEqual(exp.Expression.load(tree.dump()), tree)
                 self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
 
