@@ -479,10 +479,16 @@ class DorisGenerator(MySQLGenerator):
             leaf_type = leaf_type.expressions[0]
         fixed = bool(leaf_type.expressions)
 
-        def number_input(value: exp.Expr) -> tuple[str, int, int] | None:
+        def number_input(
+            value: exp.Expr, numeric_string: bool = False
+        ) -> tuple[str, int, int] | None:
             literal = value.this if isinstance(value, exp.Neg) else value
             text = literal.name.strip(" \t\n\r\f\v")
-            if fixed and literal.is_string and _PG_INTEGER_INPUT.fullmatch(text):
+            if (
+                (fixed or numeric_string)
+                and literal.is_string
+                and _PG_INTEGER_INPUT.fullmatch(text)
+            ):
                 unsigned = text.lstrip("+-").lower().replace("_", "")
                 base = {"0x": 16, "0o": 8, "0b": 2}.get(unsigned[:2], 10)
                 digits = (unsigned if base == 10 else unsigned[2:]).lstrip("0") or "0"
@@ -491,7 +497,11 @@ class DorisGenerator(MySQLGenerator):
                 text = str(int(digits, base) * (-1 if text.startswith("-") else 1))
             if (
                 literal.is_number
-                or (fixed and literal.is_string and _PG_DECIMAL_NUMERIC_INPUT.fullmatch(text))
+                or (
+                    (fixed or numeric_string)
+                    and literal.is_string
+                    and _PG_DECIMAL_NUMERIC_INPUT.fullmatch(text)
+                )
             ) and len(text) <= 4096:
                 try:
                     number = Decimal(text.replace("_", ""))
@@ -528,6 +538,16 @@ class DorisGenerator(MySQLGenerator):
             elif type(value) is exp.Cast:
                 if (width := widths.get(value.to.this)) is not None:
                     return width, 0
+                parameters = value.to.expressions
+                if (
+                    value.to.is_type(exp.DType.DECIMAL)
+                    and 1 <= len(parameters) <= 2
+                    and all(param.this.is_int for param in parameters)
+                ):
+                    precision = int(parameters[0].this.to_py())
+                    scale = int(parameters[1].this.to_py()) if len(parameters) == 2 else 0
+                    if 0 < precision <= 76 and 0 <= scale <= precision:
+                        return precision - scale, scale
             elif (
                 value.is_leaf()
                 and not isinstance(value, (exp.Func, exp.Literal))
@@ -542,8 +562,6 @@ class DorisGenerator(MySQLGenerator):
             return None
 
         resolved = bounds(expression)
-        if fixed and not resolved:
-            return self.func("ARRAY", *expression.expressions)
         integers, scale = resolved or (77, 0)
         scale = scale or 0
         precision = max(integers + scale, 1)
@@ -552,12 +570,14 @@ class DorisGenerator(MySQLGenerator):
             if 1 <= len(parameters) <= 2 and all(param.this.is_int for param in parameters):
                 precision = int(parameters[0].this.to_py())
                 scale = int(parameters[1].this.to_py()) if len(parameters) == 2 else 0
-                if not (resolved and 0 <= scale <= precision <= 76 and precision > 0):
+                if not (0 <= scale <= precision <= 76 and precision > 0):
                     precision = 77
             else:
                 precision = 77
         if precision > 76:
             self.unsupported("Doris cannot preserve this PostgreSQL NUMERIC array domain")
+            return self.func("ARRAY", *expression.expressions)
+        if fixed and not resolved:
             return self.func("ARRAY", *expression.expressions)
         dtype = exp.DataType(
             this=exp.DType.DECIMAL,
@@ -566,6 +586,30 @@ class DorisGenerator(MySQLGenerator):
                 exp.DataTypeParam(this=exp.Literal.number(scale)),
             ],
         )
+
+        def preserve_cast(value: exp.Expr, depth: int = 0) -> exp.Expr:
+            value = value.unnest() if isinstance(value, exp.Paren) else value
+            if type(value) is not exp.Cast or not value.to.is_type(exp.DType.DECIMAL):
+                return value.copy()
+            inner = value.this.unnest()
+            if inner.is_number or inner.is_string:
+                number = number_input(inner, numeric_string=True)
+                if number is None:
+                    self.unsupported("Doris cannot preserve this PostgreSQL NUMERIC input")
+                    return value.copy()
+                inner = exp.Literal.string(number[0])
+            else:
+                inner = exp.cast(preserve_cast(inner, depth + 1), exp.DType.TEXT)
+            parameter = exp.to_identifier(f"_pg_numeric_cast_{depth}")
+            return exp.Bracket(
+                this=exp.func(
+                    "ARRAY_MAP",
+                    exp.Lambda(this=exp.cast(parameter, value.to.copy()), expressions=[parameter]),
+                    exp.Array(expressions=[inner]),
+                ),
+                expressions=[exp.Literal.number(1)],
+                offset=self.dialect.INDEX_OFFSET,
+            )
 
         def build(array: exp.Array) -> exp.Expr:
             inputs = []
@@ -576,7 +620,7 @@ class DorisGenerator(MySQLGenerator):
                 elif (number := number_input(literal)) is not None:
                     inputs.append(exp.Literal.string(number[0]))
                 else:
-                    inputs.append(exp.cast(value.copy(), exp.DType.TEXT))
+                    inputs.append(exp.cast(preserve_cast(value), exp.DType.TEXT))
             return exp.Array(expressions=inputs)
 
         def convert(value: exp.Expr, element: exp.DataType, depth: int = 0) -> exp.Expr:

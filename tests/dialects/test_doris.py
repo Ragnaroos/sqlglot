@@ -714,7 +714,10 @@ class TestDoris(Validator):
             ),
             (
                 "SELECT ARRAY[1.25::DECIMAL(10, 2), NULL::DECIMAL(10, 2)]",
-                "SELECT ARRAY(CAST(1.25 AS DECIMAL(10, 2)), CAST(NULL AS DECIMAL(10, 2)))",
+                "SELECT ARRAY_MAP(_pg_numeric_input -> CAST(_pg_numeric_input AS DECIMAL(10, 2)), "
+                "ARRAY(CAST(ARRAY_MAP(_pg_numeric_cast_0 -> CAST(_pg_numeric_cast_0 AS DECIMAL(10, 2)), "
+                "ARRAY('1.25'))[1] AS STRING), CAST(ARRAY_MAP(_pg_numeric_cast_0 -> "
+                "CAST(_pg_numeric_cast_0 AS DECIMAL(10, 2)), ARRAY(CAST(NULL AS STRING)))[1] AS STRING)))",
             ),
             (
                 "SELECT ARRAY['hello', 'world', '']",
@@ -924,6 +927,27 @@ class TestDoris(Validator):
         for source in ("ARRAY[1e40,2]::NUMERIC(77,0)[]", "ARRAY[0.0125]::NUMERIC(2,3)[]"):
             with self.subTest(source), self.assertRaises(UnsupportedError):
                 parse_one(source, read="postgres").sql("doris", unsupported_level=ErrorLevel.RAISE)
+
+    def test_postgres_numeric_cast_elements(self):
+        for source in (
+            "ARRAY[123456789012345678901234567890123456789::NUMERIC(40,0),2::NUMERIC(40,0)]",
+            "ARRAY[1.234567890123456789::NUMERIC(30,18),NULL::NUMERIC(30,18)]",
+            "ARRAY['1.245'::NUMERIC(6,2)::NUMERIC(6,1)]",
+            "ARRAY['1.245'::NUMERIC(6,2)]::NUMERIC(6,1)[]",
+            "ARRAY[[1e40::NUMERIC(50,0),2::NUMERIC(50,0)],[3::NUMERIC(50,0),NULL::NUMERIC(50,0)]]",
+        ):
+            with self.subTest(source):
+                tree = parse_one("SELECT " + source + " AS xs", read="postgres")
+                before = tree.copy()
+                target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree, before)
+                self.assertIn("ARRAY_MAP", target)
+                self.assertIn("_pg_numeric_cast_0", target)
+                if "::NUMERIC(6,2)::NUMERIC(6,1)" in source:
+                    self.assertIn("_pg_numeric_cast_1", target)
+                self.validate_identity(target)
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
 
     def test_postgres_array_unknown_inputs(self):
         for source, expected in (
