@@ -186,29 +186,15 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
     if not expressions:
         return None
     types = [resolve(expression) for expression in expressions]
-    if any(dtype is None for dtype in types):
-        return None
     result: exp.DataType | None = types[0]
+    if result is None:
+        return None
     for dtype in types[1:]:
         if dtype is None:
             return None
         result = common(result, dtype)
         if result is None:
             return None
-    # Unknown strings use type-specific input functions. Only these types have a
-    # corresponding source-input conversion in the Doris array generator.
-    if any(expression.unnest().is_string for expression in expressions) and not result.is_type(
-        exp.DType.UNKNOWN,
-        exp.DType.TEXT,
-        exp.DType.SMALLINT,
-        exp.DType.INT,
-        exp.DType.BIGINT,
-        exp.DType.BOOLEAN,
-        exp.DType.FLOAT,
-        exp.DType.DOUBLE,
-        exp.DType.DECIMAL,
-    ):
-        return None
     return exp.DataType.build(exp.DType.TEXT) if result.is_type(exp.DType.UNKNOWN) else result
 
 

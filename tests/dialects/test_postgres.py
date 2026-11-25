@@ -51,6 +51,33 @@ class TestPostgres(Validator):
         ):
             self.assertNotIn("element_type", parse_one(source, read=dialect).args)
 
+    def test_unknown_subarray_source_type(self):
+        for source, dtype in (
+            ("ARRAY[ARRAY[1, 2], '{3,4}']", "ARRAY<INT>"),
+            ("ARRAY['{3,4}', ARRAY[1, 2]]", "ARRAY<INT>"),
+            ("ARRAY[(ARRAY[1, 2]), '{3,4}']", "ARRAY<INT>"),
+            ("ARRAY[ARRAY['a', 'b'], '{c,d}']", "ARRAY<TEXT>"),
+            ("ARRAY[ARRAY[2147483648, 2], '{3,4}']", "ARRAY<BIGINT>"),
+            ("ARRAY[ARRAY[1.20, 2.00], '{3.40,5.60}']", "ARRAY<DECIMAL>"),
+            ("ARRAY[ARRAY[CAST(x AS INT), CAST(y AS INT)], '{3,4}']", "ARRAY<INT>"),
+        ):
+            with self.subTest(source=source):
+                tree = self.validate_identity(source)
+                self.assertEqual(tree.args["element_type"], exp.DataType.build(dtype))
+                before = tree.copy()
+                for dialect in ("postgres", "spark", "duckdb"):
+                    tree.sql(dialect, copy=False)
+                    self.assertEqual(tree, before)
+                with self.assertRaises(UnsupportedError):
+                    tree.sql("doris", unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree, before)
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
+
+        for source in ("ARRAY[x,'{1,2}']", "ARRAY['{1,2}',x]", "ARRAY[1,x]", "ARRAY[x,1]"):
+            with self.subTest(source=source):
+                self.assertNotIn("element_type", parse_one(source, read="postgres").args)
+
     def test_numeric_array_type_constraints(self):
         for source, expected in (
             ("ARRAY[1.20::NUMERIC(6,2)]", "DECIMAL(6, 2)"),

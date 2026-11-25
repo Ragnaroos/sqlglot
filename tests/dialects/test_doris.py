@@ -895,6 +895,21 @@ class TestDoris(Validator):
             with self.subTest(source), self.assertRaises(UnsupportedError):
                 parse_one(source, read="postgres").sql("doris", unsupported_level=ErrorLevel.RAISE)
 
+    def test_postgres_unknown_subarray_conversion(self):
+        for source in (
+            "ARRAY[ARRAY[1,2],'{3,4}']",
+            "ARRAY['{3,4}',ARRAY[1,2]]",
+            "ARRAY[ARRAY['a','b'],'{c,d}']",
+            "ARRAY[(SELECT ARRAY[1,2]),'{3,4}']",
+            "ARRAY[ARRAY[x::INT,y::INT],'{3,4}']",
+        ):
+            with self.subTest(source=source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                with self.assertRaisesRegex(UnsupportedError, "array input conversion"):
+                    tree.sql("doris", unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree, before)
+
     def test_postgres_fixed_numeric_array_cast(self):
         for values, precision, scale, inputs in (
             ("1e40, 2", 50, 0, "'" + "1" + "0" * 40 + "', '2'"),
