@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import typing as t
+from decimal import Decimal, InvalidOperation
 
 from sqlglot import exp
 from sqlglot.dialects.dialect import (
@@ -19,6 +20,11 @@ from sqlglot.optimizer.annotate_types import annotate_types
 _PG_INTEGER_INPUT = re.compile(
     r"[+-]?(?:[0-9](?:_?[0-9])*|0[xX]_?[0-9a-fA-F](?:_?[0-9a-fA-F])*"
     r"|0[oO]_?[0-7](?:_?[0-7])*|0[bB]_?[01](?:_?[01])*)"
+)
+_PG_DECIMAL_FLOAT_INPUT = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+_PG_HEX_FLOAT_INPUT = re.compile(
+    r"([+-]?)0[xX]([0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?|\.[0-9a-fA-F]+)"
+    r"(?:[pP]([+-]?[0-9]+))?"
 )
 
 
@@ -292,7 +298,7 @@ class DorisGenerator(MySQLGenerator):
         if (
             expression.to.is_type(exp.DType.ARRAY)
             and isinstance(value, exp.Array)
-            and value.args.get("element_type")
+            and any(array.args.get("element_type") for array in value.find_all(exp.Array))
         ):
             # PG applies the explicit constructor cast to unknown elements,
             # overriding the constructor's provisional common type.
@@ -312,6 +318,8 @@ class DorisGenerator(MySQLGenerator):
                 exp.DType.SMALLINT,
                 exp.DType.INT,
                 exp.DType.BIGINT,
+                exp.DType.FLOAT,
+                exp.DType.DOUBLE,
             )
             else None,
         )
@@ -333,10 +341,20 @@ class DorisGenerator(MySQLGenerator):
         if element_type:
             array = expression.copy()
             array.set("element_type", None)
-            array.set(
-                "expressions",
-                [self._coerce_array_input(value, element_type) for value in expressions],
+            inputs = [self._coerce_array_input(value, element_type) for value in expressions]
+            runtime_float = element_type.is_type(exp.DType.FLOAT) and any(
+                value != converted for value, converted in zip(expressions, inputs)
             )
+            array.set("expressions", inputs)
+            if runtime_float:
+                # Keep FLOAT conversion inside a lambda: Doris's constant FLOAT
+                # array cast can change the already rounded input once more.
+                parameter = exp.to_identifier("_pg_array_value")
+                return self.func(
+                    "ARRAY_MAP",
+                    exp.Lambda(this=exp.cast(parameter, exp.DType.FLOAT), expressions=[parameter]),
+                    array,
+                )
             return super().cast_sql(
                 exp.cast(
                     array,
@@ -348,7 +366,111 @@ class DorisGenerator(MySQLGenerator):
         return self.func("ARRAY", *expressions)
 
     def _coerce_array_input(self, expression: exp.Expr, dtype: exp.DataType) -> exp.Expr:
-        literal = expression.unnest()
+        literal = expression
+        while isinstance(literal, exp.Paren):
+            literal = literal.this
+        if dtype.is_type(exp.DType.FLOAT, exp.DType.DOUBLE):
+            if isinstance(literal, exp.Subquery):
+                query = literal.this
+                if (
+                    isinstance(query, exp.Select)
+                    and len(query.expressions) == 1
+                    and not any(value for key, value in query.args.items() if key != "expressions")
+                ):
+                    projection = query.expressions[0]
+                    value = self._coerce_array_input(projection.unalias(), dtype)
+                    if value != projection.unalias():
+                        result = literal.copy()
+                        if isinstance(projection, exp.Alias):
+                            projection = projection.copy()
+                            projection.set("this", value)
+                        else:
+                            projection = value
+                        result.this.set("expressions", [projection])
+                        return result
+                return expression.copy()
+            if isinstance(literal, exp.Neg):
+                value = self._coerce_array_input(literal.this, dtype)
+                return exp.Neg(this=value) if value != literal.this else expression.copy()
+            casts: list[exp.DataType | None] = []
+            value = literal
+            while True:
+                if type(value) is exp.Cast and value.to.is_type(exp.DType.FLOAT, exp.DType.DOUBLE):
+                    casts.append(value.to)
+                elif isinstance(value, exp.Neg) and not value.is_number:
+                    casts.append(None)
+                else:
+                    break
+                value = value.this.unnest()
+            if (
+                casts
+                and (value.is_string or value.is_number)
+                and (
+                    any(cast is not None and cast.is_type(exp.DType.FLOAT) for cast in casts)
+                    or (value.is_string and _PG_HEX_FLOAT_INPUT.fullmatch(value.to_py().strip()))
+                )
+            ):
+                original = (
+                    "-" + str(value.this.to_py())
+                    if isinstance(value, exp.Neg)
+                    else str(value.to_py())
+                ).strip(" \t\n\r\f\v")
+                normalized = original
+                for cast in reversed(casts):
+                    if cast is None:
+                        normalized = (
+                            normalized[1:] if normalized.startswith("-") else "-" + normalized
+                        )
+                        continue
+                    rounded = self._array_float_input(normalized, cast)
+                    if rounded is None:
+                        # Non-finite and unsupported cast inputs retain their
+                        # existing generation outside this finite-input rule.
+                        return expression.copy()
+                    normalized = rounded
+                # Preserve each source cast before promotion to the ARRAY's type.
+                # Exact inputs can retain their existing CASTs unchanged.
+                try:
+                    unchanged = Decimal(normalized) == Decimal(original)
+                except InvalidOperation:
+                    unchanged = False
+                if not unchanged:
+                    return exp.cast(exp.Literal.string(normalized), exp.DType.DOUBLE)
+            elif (
+                not isinstance(value, exp.Query)
+                and not value.is_string
+                and not value.is_number
+                and casts
+                and next((cast for cast in reversed(casts) if cast is not None), None)
+                == exp.DataType.build(exp.DType.DOUBLE)
+                and any(cast is not None and cast.is_type(exp.DType.FLOAT) for cast in casts)
+            ):
+                result = value.copy()
+                previous = None
+                for cast in reversed(casts):
+                    if cast is None:
+                        result = exp.Neg(this=result)
+                        continue
+                    if cast.is_type(exp.DType.FLOAT) and previous == exp.DType.DOUBLE:
+                        parameter = exp.to_identifier("_pg_real_input")
+                        result = exp.Bracket(
+                            this=exp.Anonymous(
+                                this="ARRAY_MAP",
+                                expressions=[
+                                    exp.Lambda(
+                                        this=exp.cast(parameter, exp.DType.FLOAT),
+                                        expressions=[parameter],
+                                    ),
+                                    exp.Array(expressions=[result]),
+                                ],
+                            ),
+                            expressions=[exp.Literal.number(1)],
+                            offset=self.dialect.INDEX_OFFSET,
+                        )
+                    else:
+                        result = exp.cast(result, cast.copy())
+                    previous = cast.this
+                return result
         if not literal.is_string or dtype.is_type(exp.DType.TEXT):
             return expression.copy()
 
@@ -376,13 +498,75 @@ class DorisGenerator(MySQLGenerator):
             }
             if len(matches) == 1:
                 normalized = matches.pop()
+        elif dtype.is_type(exp.DType.FLOAT, exp.DType.DOUBLE):
+            normalized = self._array_float_input(value, dtype)
 
         if normalized is None:
             self.unsupported("Doris cannot preserve this PostgreSQL array input conversion")
         else:
             literal = literal.copy()
             literal.set("this", normalized)
-        return exp.cast(literal.copy(), dtype.copy())
+        return exp.cast(
+            literal.copy(),
+            exp.DType.DOUBLE if dtype.is_type(exp.DType.FLOAT) else dtype.copy(),
+        )
+
+    def _array_float_input(self, value: str, dtype: exp.DataType) -> str | None:
+        # Round input directly to the source IEEE format: Doris can
+        # round through DOUBLE before storing FLOAT, unlike PostgreSQL strtof.
+        # Bound work before constructing the exact ratio for extreme exponents.
+        if len(value) > 4096:
+            return None
+        if re.fullmatch(r"[+-]?(?:nan|inf(?:inity)?)", value, re.IGNORECASE | re.ASCII):
+            return (
+                "NaN"
+                if value.lstrip("+-").lower() == "nan"
+                else ("-Infinity" if value.startswith("-") else "Infinity")
+            )
+        precision, minimum, maximum, decimal_minimum, decimal_maximum = (
+            (24, -149, 127, -46, 38)
+            if dtype.is_type(exp.DType.FLOAT)
+            else (53, -1074, 1023, -324, 308)
+        )
+        hexadecimal = _PG_HEX_FLOAT_INPUT.fullmatch(value)
+        if hexadecimal:
+            sign, mantissa, power = hexadecimal.groups()
+            power = power or "0"
+            if len(power.lstrip("+-").lstrip("0")) > 5 or abs(int(power)) > 20000:
+                return None
+            fraction = mantissa.partition(".")[2]
+            shift = int(power) - 4 * len(fraction)
+            numerator = int(mantissa.replace(".", ""), 16) << max(0, shift)
+            denominator = 1 << max(0, -shift)
+            negative = sign == "-"
+        elif _PG_DECIMAL_FLOAT_INPUT.fullmatch(value):
+            try:
+                number = Decimal(value)
+            except InvalidOperation:
+                return None
+            if number and not decimal_minimum <= number.adjusted() <= decimal_maximum:
+                return None
+            numerator, denominator = number.copy_abs().as_integer_ratio()
+            negative = number.is_signed()
+        else:
+            return None
+        if not numerator:
+            return "-0" if negative else "0"
+        exponent = numerator.bit_length() - denominator.bit_length()
+        if (numerator << max(0, -exponent)) < (denominator << max(0, exponent)):
+            exponent -= 1
+        shift = max(exponent - precision + 1, minimum)
+        scaled_denominator = denominator << max(0, shift)
+        significand, remainder = divmod(numerator << max(0, -shift), scaled_denominator)
+        if 2 * remainder > scaled_denominator or (
+            2 * remainder == scaled_denominator and significand % 2
+        ):
+            significand += 1
+        if not significand or significand.bit_length() + shift - 1 > maximum:
+            return None
+        integer = significand << shift if shift >= 0 else significand * 5 ** (-shift)
+        decimal = Decimal((int(negative), tuple(map(int, str(integer))), min(shift, 0)))
+        return format(decimal, "f").rstrip("0").rstrip(".") if shift < 0 else str(decimal)
 
     def match_sql(self, expression: exp.Match) -> str:
         kind = expression.text("kind")

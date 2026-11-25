@@ -53,6 +53,10 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
                 return dtype.copy()
         elif isinstance(expression, exp.Boolean):
             return exp.DataType.build(exp.DType.BOOLEAN)
+        elif isinstance(expression, exp.Neg):
+            dtype = resolve(expression.this)
+            if dtype and dtype.is_type(exp.DType.FLOAT, exp.DType.DOUBLE):
+                return dtype
         elif isinstance(expression, exp.Array):
             dtype = expression.args.get("element_type")
             if dtype:
@@ -104,7 +108,8 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
         result = common(result, dtype)
         if result is None:
             return None
-    # Only enable source input conversions supplied by the Doris generator.
+    # Unknown strings use type-specific input functions. Only these types have a
+    # corresponding source-input conversion in the Doris array generator.
     if any(expression.unnest().is_string for expression in expressions) and not result.is_type(
         exp.DType.UNKNOWN,
         exp.DType.TEXT,
@@ -112,6 +117,8 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
         exp.DType.INT,
         exp.DType.BIGINT,
         exp.DType.BOOLEAN,
+        exp.DType.FLOAT,
+        exp.DType.DOUBLE,
     ):
         return None
     return exp.DataType.build(exp.DType.TEXT) if result.is_type(exp.DType.UNKNOWN) else result
