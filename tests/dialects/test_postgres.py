@@ -11,6 +11,35 @@ class TestPostgres(Validator):
     maxDiff = None
     dialect = "postgres"
 
+    def test_sample_aggregate_null_contract(self):
+        for function, kind in (
+            ("STDDEV", exp.Stddev),
+            ("STDDEV_SAMP", exp.StddevSamp),
+            ("VARIANCE", exp.Variance),
+            ("VAR_SAMP", exp.Variance),
+            ("COVAR_SAMP", exp.CovarSamp),
+        ):
+            argument = "x, y" if kind is exp.CovarSamp else "x"
+            with self.subTest(function):
+                sql = f"SELECT {function}({argument}) FROM t"
+                tree = parse_one(sql, read="postgres")
+                self.assertIsInstance(tree.expressions[0], kind)
+                self.assertIs(tree.expressions[0].args.get("null_on_insufficient_samples"), True)
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                self.assertEqual(tree.sql("postgres"), sql.replace("VARIANCE", "VAR_SAMP"))
+                self.assertFalse(
+                    parse_one(sql, read="doris")
+                    .expressions[0]
+                    .args.get("null_on_insufficient_samples")
+                )
+
+        for function in ("STDDEV_POP", "VAR_POP", "COVAR_POP"):
+            argument = "x, y" if function == "COVAR_POP" else "x"
+            self.assertNotIn(
+                "null_on_insufficient_samples",
+                parse_one(f"{function}({argument})", read="postgres").args,
+            )
+
     def test_every(self):
         for argument in ("b", "NOT b", "DISTINCT b", "CAST(NULL AS BOOLEAN)"):
             source = f"SELECT EVERY({argument}) AS v FROM t"

@@ -23,6 +23,42 @@ def _lag_lead_sql(self, expression: exp.Lag | exp.Lead) -> str:
     )
 
 
+def _sample_aggregate_sql(
+    self, expression: exp.Stddev | exp.StddevSamp | exp.Variance | exp.CovarSamp
+) -> str:
+    if isinstance(expression, exp.Variance) and not expression.args.get(
+        "null_on_insufficient_samples"
+    ):
+        return self.variance_sql(expression)
+
+    name = (
+        "COVAR_SAMP"
+        if isinstance(expression, exp.CovarSamp)
+        else "VAR_SAMP"
+        if isinstance(expression, exp.Variance)
+        else "STDDEV_SAMP"
+    )
+    aggregate = self.func(name, expression.this, expression.expression)
+    context = expression.find_ancestor(exp.Window, exp.Filter, exp.WithinGroup, exp.Select)
+    if (
+        not expression.args.get("null_on_insufficient_samples")
+        or isinstance(context, (exp.Window, exp.Filter, exp.WithinGroup))
+        or isinstance(expression.this, exp.Order)
+    ):
+        return aggregate
+
+    value = expression.this.copy()
+    if isinstance(expression, exp.CovarSamp):
+        # COUNT ignores a pair when either input is NULL.
+        value = exp.If(
+            this=value.is_(exp.null()), true=exp.null(), false=expression.expression.copy()
+        )
+    count = exp.Count(this=value)
+    return self.func(
+        "IF", exp.LT(this=count, expression=exp.Literal.number(2)), exp.null(), aggregate
+    )
+
+
 class DorisGenerator(MySQLGenerator):
     def filter_sql(self, expression: exp.Filter) -> str:
         aggregate = expression.this
@@ -147,6 +183,7 @@ class DorisGenerator(MySQLGenerator):
         exp.ArrayUniqueAgg: rename_func("COLLECT_SET"),
         exp.CurrentDate: lambda self, _: self.func("CURRENT_DATE"),
         exp.CurrentTimestamp: lambda self, _: self.func("NOW"),
+        exp.CovarSamp: _sample_aggregate_sql,
         exp.DateTrunc: lambda self, e: self.func(
             "DATE_TRUNC", e.this, weekstart_unit_to_str(self, e)
         ),
@@ -165,6 +202,8 @@ class DorisGenerator(MySQLGenerator):
         exp.Split: rename_func("SPLIT_BY_STRING"),
         exp.StringToArray: rename_func("SPLIT_BY_STRING"),
         exp.StrToUnix: lambda self, e: self.func("UNIX_TIMESTAMP", e.this, self.format_time(e)),
+        exp.Stddev: _sample_aggregate_sql,
+        exp.StddevSamp: _sample_aggregate_sql,
         exp.TimeStrToDate: rename_func("TO_DATE"),
         exp.TsOrDsAdd: lambda self, e: self.func("DATE_ADD", e.this, e.expression),
         exp.TsOrDsToDate: lambda self, e: self.func("TO_DATE", e.this),
@@ -176,6 +215,7 @@ class DorisGenerator(MySQLGenerator):
             "FROM_UNIXTIME", e.this, time_format("doris")(self, e)
         ),
         exp.UnixToTime: rename_func("FROM_UNIXTIME"),
+        exp.Variance: _sample_aggregate_sql,
     }
 
     # https://github.com/apache/doris/blob/e4f41dbf1ec03f5937fdeba2ee1454a20254015b/fe/fe-core/src/main/antlr4/org/apache/doris/nereids/DorisLexer.g4#L93
