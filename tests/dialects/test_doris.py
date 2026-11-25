@@ -69,6 +69,105 @@ class TestDoris(Validator):
                     expected,
                 )
 
+    def test_array_agg_value_ordering(self):
+        for distinct in ("", "DISTINCT "):
+            aggregate = f"ARRAY_AGG({distinct}a)"
+            nonnull_aggregate = f"COLLECT_LIST({distinct}a)"
+            for order, sorted_array in (
+                ("a", f"ARRAY_SORT({nonnull_aggregate})"),
+                ("a ASC NULLS FIRST", f"ARRAY_SORT({nonnull_aggregate})"),
+                ("a ASC NULLS LAST", f"ARRAY_SORT({nonnull_aggregate})"),
+                ("a DESC", f"ARRAY_REVERSE_SORT({nonnull_aggregate})"),
+                ("a DESC NULLS FIRST", f"ARRAY_REVERSE_SORT({nonnull_aggregate})"),
+                ("a DESC NULLS LAST", f"ARRAY_REVERSE_SORT({nonnull_aggregate})"),
+            ):
+                nulls_first = order in ("a ASC NULLS FIRST", "a DESC", "a DESC NULLS FIRST")
+                nulls = f"ARRAY_SLICE(ARRAY_SORT({aggregate}), 1, ARRAY_SIZE({aggregate}) - ARRAY_SIZE({nonnull_aggregate}))"
+                parts = f"{nulls}, {sorted_array}" if nulls_first else f"{sorted_array}, {nulls}"
+                expected = f"SELECT NULLIF(ARRAY_CONCAT({parts}), ARRAY()) AS xs FROM t"
+                source = f"SELECT ARRAY_AGG({distinct}a ORDER BY {order}) AS xs FROM t"
+                with self.subTest(source):
+                    self.validate_all(
+                        expected, read={"postgres": source}, write={"doris": expected}
+                    )
+                    tree = parse_one(source, read="postgres")
+                    original = tree.copy()
+                    self.assertEqual(
+                        tree.sql("doris", unsupported_level=ErrorLevel.RAISE), expected
+                    )
+                    self.assertEqual(tree, original)
+                    self.validate_identity(expected)
+
+        expected = (
+            "SELECT NULLIF(ARRAY_CONCAT("
+            "ARRAY_SORT(COLLECT_LIST(CAST(a AS BIGINT))), "
+            "ARRAY_SLICE(ARRAY_SORT(ARRAY_AGG(CAST(a AS BIGINT))), 1, "
+            "ARRAY_SIZE(ARRAY_AGG(CAST(a AS BIGINT))) - "
+            "ARRAY_SIZE(COLLECT_LIST(CAST(a AS BIGINT))))), ARRAY()) FROM t"
+        )
+        self.validate_all(
+            expected,
+            read={
+                "postgres": "SELECT ARRAY_AGG(CAST(a AS BIGINT) ORDER BY CAST(a AS BIGINT)) FROM t"
+            },
+        )
+
+    def test_array_agg_value_ordering_contexts(self):
+        self.validate_identity("SELECT ARRAY_SIZE(a) FROM t")
+        aggregate = (
+            "NULLIF(ARRAY_CONCAT(ARRAY_SORT(COLLECT_LIST(a)), "
+            "ARRAY_SLICE(ARRAY_SORT(ARRAY_AGG(a)), 1, "
+            "ARRAY_SIZE(ARRAY_AGG(a)) - ARRAY_SIZE(COLLECT_LIST(a)))), ARRAY())"
+        )
+        for source, expected in (
+            (
+                "SELECT ARRAY_AGG(a ORDER BY a) AS xs FROM t WHERE FALSE HAVING ARRAY_AGG(a ORDER BY a) IS NULL",
+                f"SELECT {aggregate} AS xs FROM t WHERE FALSE HAVING {aggregate} IS NULL",
+            ),
+            (
+                "SELECT g, ARRAY_AGG(a ORDER BY a) AS xs FROM t GROUP BY g ORDER BY g",
+                f"SELECT g, {aggregate} AS xs FROM t GROUP BY g ORDER BY g NULLS LAST",
+            ),
+            (
+                "SELECT (SELECT ARRAY_AGG(a ORDER BY a) FROM t WHERE FALSE) AS xs",
+                f"SELECT (SELECT {aggregate} FROM t WHERE FALSE) AS xs",
+            ),
+        ):
+            with self.subTest(source):
+                self.validate_all(expected, read={"postgres": source}, write={"doris": expected})
+                self.validate_identity(expected)
+
+    def test_array_agg_value_ordering_exclusions(self):
+        for source, expected in (
+            (
+                "SELECT ARRAY_AGG(a ORDER BY a, b) FROM t",
+                "SELECT COLLECT_LIST(a ORDER BY a NULLS LAST, b NULLS LAST) FROM t",
+            ),
+            (
+                'SELECT ARRAY_AGG(a ORDER BY a COLLATE "C") FROM t',
+                "SELECT COLLECT_LIST(a ORDER BY a COLLATE `C` NULLS LAST) FROM t",
+            ),
+            (
+                "SELECT ARRAY_AGG(RANDOM() ORDER BY RANDOM()) FROM t",
+                "SELECT COLLECT_LIST(RAND() ORDER BY RAND() NULLS LAST) FROM t",
+            ),
+            (
+                "SELECT ARRAY_AGG(a ORDER BY a) FILTER(WHERE p) FROM t",
+                "SELECT COLLECT_LIST(a ORDER BY a NULLS LAST) FILTER(WHERE p) FROM t",
+            ),
+            (
+                "SELECT ARRAY_AGG(a ORDER BY a) OVER () FROM t",
+                "SELECT COLLECT_LIST(a ORDER BY a NULLS LAST) OVER () FROM t",
+            ),
+        ):
+            with self.subTest(source):
+                self.assertEqual(
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    ),
+                    expected,
+                )
+
     def test_null_ordering(self):
         for source, expected in (
             ("SELECT a FROM t ORDER BY 1", "SELECT a FROM t ORDER BY 1 NULLS LAST"),
