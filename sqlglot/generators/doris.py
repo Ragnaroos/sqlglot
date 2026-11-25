@@ -548,6 +548,8 @@ class DorisGenerator(MySQLGenerator):
                     scale = int(parameters[1].this.to_py()) if len(parameters) == 2 else 0
                     if 0 < precision <= 76 and 0 <= scale <= precision:
                         return precision - scale, scale
+            elif isinstance(value, exp.Neg) and not value.is_number:
+                return bounds(value.this)
             elif (
                 value.is_leaf()
                 and not isinstance(value, (exp.Func, exp.Literal))
@@ -589,6 +591,30 @@ class DorisGenerator(MySQLGenerator):
 
         def preserve_cast(value: exp.Expr, depth: int = 0) -> exp.Expr:
             value = value.unnest() if isinstance(value, exp.Paren) else value
+            if isinstance(value, exp.Neg) and not value.is_number:
+                parameter = exp.to_identifier(f"_pg_numeric_sign_{depth}")
+                result = exp.If(
+                    this=parameter.copy().is_(exp.null()),
+                    true=exp.null(),
+                    false=exp.If(
+                        this=exp.func("LEFT", parameter.copy(), 1).eq(exp.Literal.string("-")),
+                        true=exp.Substring(this=parameter.copy(), start=exp.Literal.number(2)),
+                        false=exp.func("CONCAT", exp.Literal.string("-"), parameter.copy()),
+                    ),
+                )
+                return exp.Bracket(
+                    this=exp.func(
+                        "ARRAY_MAP",
+                        exp.Lambda(this=result, expressions=[parameter]),
+                        exp.Array(
+                            expressions=[
+                                exp.cast(preserve_cast(value.this, depth + 1), exp.DType.TEXT)
+                            ]
+                        ),
+                    ),
+                    expressions=[exp.Literal.number(1)],
+                    offset=self.dialect.INDEX_OFFSET,
+                )
             if type(value) is not exp.Cast or not value.to.is_type(exp.DType.DECIMAL):
                 return value.copy()
             inner = value.this.unnest()

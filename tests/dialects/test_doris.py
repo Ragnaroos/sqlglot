@@ -949,6 +949,26 @@ class TestDoris(Validator):
                 self.assertEqual(exp.Expression.load(tree.dump()), tree)
                 self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
 
+    def test_postgres_negated_numeric_array_elements(self):
+        for source in (
+            "ARRAY[-CAST(1e40 AS NUMERIC(50,0))]",
+            "ARRAY[-CAST(NULL AS NUMERIC(50,0))]",
+            "ARRAY[-(-CAST(1e40 AS NUMERIC(50,0)))]",
+            "ARRAY[-CAST('-1.245' AS NUMERIC(6,2))::NUMERIC(6,1)]",
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree, before)
+                self.assertIn("_pg_numeric_sign_", target)
+                self.assertIn("IS NULL", target)
+                self.assertNotIn("-ARRAY_MAP", target)
+                self.validate_identity(target)
+        self.assertEqual(
+            parse_one("-CAST(x AS DECIMAL(50,0))").sql("doris"), "-CAST(x AS DECIMAL(50, 0))"
+        )
+
     def test_postgres_array_unknown_inputs(self):
         for source, expected in (
             ("ARRAY['1', 2, NULL]", "CAST(ARRAY(CAST('1' AS INT), 2, NULL) AS ARRAY<INT>)"),

@@ -132,6 +132,8 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
             dtype = resolve(expression.this)
             if dtype and dtype.is_type(exp.DType.FLOAT, exp.DType.DOUBLE):
                 return dtype
+            if dtype and dtype.is_type(exp.DType.DECIMAL):
+                return exp.DataType.build(exp.DType.DECIMAL)
         elif isinstance(expression, exp.Array):
             dtype = expression.args.get("element_type")
             if dtype:

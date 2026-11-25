@@ -57,6 +57,7 @@ class TestPostgres(Validator):
             ("ARRAY[1.20::NUMERIC(6,2),2.00::NUMERIC(6,2)]", "DECIMAL(6, 2)"),
             ("ARRAY[1.20::NUMERIC(6,2),NULL]", "DECIMAL"),
             ("ARRAY[1.20::NUMERIC(6,2),2.00::NUMERIC(10,2)]", "DECIMAL"),
+            ("ARRAY[-CAST(1e40 AS NUMERIC(50,0))]", "DECIMAL"),
         ):
             with self.subTest(source):
                 tree = parse_one(source, read="postgres")
