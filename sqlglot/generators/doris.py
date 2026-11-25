@@ -84,11 +84,10 @@ class DorisGenerator(MySQLGenerator):
 
     def withingroup_sql(self, expression: exp.WithinGroup) -> str:
         aggregate = expression.this
-        if not isinstance(aggregate, exp.PercentileCont) or not isinstance(
-            aggregate.this, exp.Array
-        ):
+        if not isinstance(aggregate, exp.PERCENTILES) or not isinstance(aggregate.this, exp.Array):
             return super().withingroup_sql(expression)
 
+        discrete = isinstance(aggregate, exp.PercentileDisc)
         order = expression.expression
         context = expression.find_ancestor(exp.Filter, exp.Window, exp.Select)
         supported = (
@@ -98,7 +97,8 @@ class DorisGenerator(MySQLGenerator):
         )
         value = order.expressions[0].this if supported else None
         key = value.unnest() if value is not None else None
-        while type(key) is exp.Cast and key.to.is_type(*exp.DataType.NUMERIC_TYPES):
+        key_types = exp.DataType.NUMERIC_TYPES | (exp.DataType.TEXT_TYPES if discrete else set())
+        while type(key) is exp.Cast and key.to.is_type(*key_types):
             key = key.this.unnest()
         supported = supported and isinstance(key, exp.Column)
 
@@ -123,13 +123,19 @@ class DorisGenerator(MySQLGenerator):
         if not supported or value is None:
             self.unsupported(
                 "Doris percentile arrays require nonempty literal probabilities in [0, 1] "
-                "or NULL, one numeric column optionally CAST, and no FILTER or OVER"
+                "or NULL, one sortable column optionally CAST, and no FILTER or OVER"
             )
             return super().withingroup_sql(expression)
 
-        value = exp.cast(value.copy(), exp.DType.DOUBLE)
+        value = value.copy() if discrete else exp.cast(value.copy(), exp.DType.DOUBLE)
         descending = order.expressions[0].args.get("desc")
         ordered_value = exp.Neg(this=value.copy()) if descending else value.copy()
+        collected = exp.ArrayAgg(this=value.copy(), nulls_excluded=True)
+        sorted_values = (
+            exp.func("ARRAY_REVERSE_SORT", collected)
+            if descending
+            else exp.ArraySort(this=collected)
+        )
 
         def expand(array: exp.Array) -> exp.Array:
             items = []
@@ -139,13 +145,27 @@ class DorisGenerator(MySQLGenerator):
                     items.append(expand(child))
                     continue
                 p = exp.cast(probability.copy(), exp.DType.DOUBLE)
-                result = exp.func(
-                    "PERCENTILE",
-                    ordered_value.copy(),
-                    exp.Coalesce(this=p.copy(), expressions=[exp.Literal.number(0)]),
-                )
-                if descending:
-                    result = exp.Neg(this=result)
+                fraction = exp.Coalesce(this=p.copy(), expressions=[exp.Literal.number(0)])
+                result: exp.Expr
+                if discrete:
+                    rank = exp.Greatest(
+                        this=exp.Literal.number(1),
+                        expressions=[
+                            exp.cast(
+                                exp.Ceil(this=fraction * exp.Count(this=value.copy())),
+                                exp.DType.BIGINT,
+                            )
+                        ],
+                    )
+                    result = exp.Bracket(
+                        this=sorted_values.copy(),
+                        expressions=[rank],
+                        offset=self.dialect.INDEX_OFFSET,
+                    )
+                else:
+                    result = exp.func("PERCENTILE", ordered_value.copy(), fraction)
+                    if descending:
+                        result = exp.Neg(this=result)
                 items.append(exp.If(this=p.is_(exp.null()), true=exp.null(), false=result))
             return exp.Array(expressions=items)
 
