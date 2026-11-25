@@ -714,7 +714,10 @@ class TestDoris(Validator):
             ),
             (
                 "SELECT ARRAY[1.25::DECIMAL(10, 2), NULL::DECIMAL(10, 2)]",
-                "SELECT ARRAY(CAST(1.25 AS DECIMAL(10, 2)), CAST(NULL AS DECIMAL(10, 2)))",
+                "SELECT ARRAY_MAP(_pg_numeric_input -> CAST(_pg_numeric_input AS DECIMAL(10, 2)), "
+                "ARRAY(CAST(ARRAY_MAP(_pg_numeric_cast_0 -> CAST(_pg_numeric_cast_0 AS DECIMAL(10, 2)), "
+                "ARRAY('1.25'))[1] AS STRING), CAST(ARRAY_MAP(_pg_numeric_cast_0 -> "
+                "CAST(_pg_numeric_cast_0 AS DECIMAL(10, 2)), ARRAY(CAST(NULL AS STRING)))[1] AS STRING)))",
             ),
             (
                 "SELECT ARRAY['hello', 'world', '']",
@@ -843,10 +846,8 @@ class TestDoris(Validator):
             with self.subTest(source[:80]), self.assertRaises(UnsupportedError):
                 parse_one(source, read="postgres").sql("doris", unsupported_level=ErrorLevel.RAISE)
 
-        # Mixed unknown strings and general NUMERIC casts have no proven integer
-        # domain; the constructor hint must not guess one or change scalar CASTs.
+        # Unknown columns and general NUMERIC casts do not establish a finite domain.
         for source in (
-            "ARRAY[9223372036854775808, '1.5']",
             "ARRAY[9223372036854775808, x]",
             "ARRAY[CAST(x AS NUMERIC), 1]",
         ):
@@ -888,9 +889,136 @@ class TestDoris(Validator):
             "ARRAY[1e-999999999999]",
             "ARRAY[0e999999999999]",
             "ARRAY[1.25, x::INT]",
+            "ARRAY[9223372036854775808, '1.5']",
+            "ARRAY[1.20::NUMERIC(6,2),'2.345']",
         ):
             with self.subTest(source), self.assertRaises(UnsupportedError):
                 parse_one(source, read="postgres").sql("doris", unsupported_level=ErrorLevel.RAISE)
+
+    def test_postgres_fixed_numeric_array_cast(self):
+        for values, precision, scale, inputs in (
+            ("1e40, 2", 50, 0, "'" + "1" + "0" * 40 + "', '2'"),
+            ("1.25, 2", 10, 2, "'1.25', '2'"),
+            ("'1.235', '-2.345', NULL", 6, 2, "'1.235', '-2.345', CAST(NULL AS STRING)"),
+            ("'0x10', '0b11', '0o17'", 6, 2, "'16', '3', '15'"),
+            ("'1_2.3_4', '+1.2e+1_0'", 20, 2, "'12.34', '12000000000'"),
+            ("NULL, NULL", 40, 0, "CAST(NULL AS STRING), CAST(NULL AS STRING)"),
+            ("1e-76, NULL", 76, 76, "'0." + "0" * 75 + "1', CAST(NULL AS STRING)"),
+        ):
+            with self.subTest(values=values):
+                tree = parse_one(
+                    f"SELECT ARRAY[{values}]::NUMERIC({precision},{scale})[] AS xs",
+                    read="postgres",
+                )
+                before = tree.copy()
+                expected = (
+                    "SELECT CAST(ARRAY_MAP(_pg_numeric_input -> CAST(_pg_numeric_input AS "
+                    f"DECIMAL({precision}, {scale})), ARRAY({inputs})) AS "
+                    f"ARRAY<DECIMAL({precision}, {scale})>) AS xs"
+                )
+                self.assertEqual(tree.sql("doris", copy=False), expected)
+                self.assertEqual(tree, before)
+                self.validate_identity(expected)
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+        self.assertIn(
+            "ARRAY_MAP(_pg_numeric_input_1",
+            parse_one("ARRAY[[1e40,2],[3,NULL]]::NUMERIC(50,0)[][]", read="postgres").sql("doris"),
+        )
+        for source in ("ARRAY[1e40,2]::NUMERIC(77,0)[]", "ARRAY[0.0125]::NUMERIC(2,3)[]"):
+            with self.subTest(source), self.assertRaises(UnsupportedError):
+                parse_one(source, read="postgres").sql("doris", unsupported_level=ErrorLevel.RAISE)
+
+    def test_postgres_unconstrained_numeric_array_cast(self):
+        for source, precision, scale, inputs in (
+            ("ARRAY['1.25','2.00']::NUMERIC[]", 3, 2, "'1.25', '2.00'"),
+            ("ARRAY[1e40,2]::NUMERIC[]", 41, 0, "'" + "1" + "0" * 40 + "', '2'"),
+            ("ARRAY[NULL,NULL]::NUMERIC[]", 1, 0, "CAST(NULL AS STRING), CAST(NULL AS STRING)"),
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                expected = (
+                    "ARRAY_MAP(_pg_numeric_input -> CAST(_pg_numeric_input AS "
+                    f"DECIMAL({precision}, {scale})), ARRAY({inputs}))"
+                )
+                self.assertEqual(tree.sql("doris", copy=False), expected)
+                self.assertEqual(tree, before)
+                self.validate_identity(expected)
+        with self.assertRaises(UnsupportedError):
+            parse_one("ARRAY['1.25','2']::NUMERIC[]", read="postgres").sql(
+                "doris", unsupported_level=ErrorLevel.RAISE
+            )
+
+    def test_postgres_numeric_cast_elements(self):
+        for source in (
+            "ARRAY[123456789012345678901234567890123456789::NUMERIC(40,0),2::NUMERIC(40,0)]",
+            "ARRAY[1.234567890123456789::NUMERIC(30,18),NULL::NUMERIC(30,18)]",
+            "ARRAY['1.245'::NUMERIC(6,2)::NUMERIC(6,1)]",
+            "ARRAY['1.245'::NUMERIC(6,2)]::NUMERIC(6,1)[]",
+            "ARRAY[[1e40::NUMERIC(50,0),2::NUMERIC(50,0)],[3::NUMERIC(50,0),NULL::NUMERIC(50,0)]]",
+        ):
+            with self.subTest(source):
+                tree = parse_one("SELECT " + source + " AS xs", read="postgres")
+                before = tree.copy()
+                target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree, before)
+                self.assertIn("ARRAY_MAP", target)
+                self.assertIn("_pg_numeric_cast_0", target)
+                if "::NUMERIC(6,2)::NUMERIC(6,1)" in source:
+                    self.assertIn("_pg_numeric_cast_1", target)
+                self.validate_identity(target)
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
+
+    def test_postgres_negated_numeric_array_elements(self):
+        for source in (
+            "ARRAY[-CAST(1e40 AS NUMERIC(50,0))]",
+            "ARRAY[-CAST(NULL AS NUMERIC(50,0))]",
+            "ARRAY[-(-CAST(1e40 AS NUMERIC(50,0)))]",
+            "ARRAY[-CAST('-1.245' AS NUMERIC(6,2))::NUMERIC(6,1)]",
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree, before)
+                self.assertIn("_pg_numeric_sign_", target)
+                self.assertIn("IS NULL", target)
+                self.assertNotIn("-ARRAY_MAP", target)
+                self.validate_identity(target)
+        self.assertEqual(
+            parse_one("-CAST(x AS DECIMAL(50,0))").sql("doris"), "-CAST(x AS DECIMAL(50, 0))"
+        )
+
+    def test_postgres_unknown_numeric_array_inputs(self):
+        for source, precision, scale, inputs in (
+            (
+                "ARRAY[9223372036854775808,'18446744073709551616',NULL]",
+                20,
+                0,
+                "'9223372036854775808', '18446744073709551616', CAST(NULL AS STRING)",
+            ),
+            ("ARRAY[1.25,'2.00']", 3, 2, "'1.25', '2.00'"),
+            ("ARRAY['1.20',2.00]", 3, 2, "'1.20', '2.00'"),
+            (
+                "ARRAY[9223372036854775808,'0x_ff','1_000']",
+                19,
+                0,
+                "'9223372036854775808', '255', '1000'",
+            ),
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                expected = (
+                    "ARRAY_MAP(_pg_numeric_input -> CAST(_pg_numeric_input AS "
+                    f"DECIMAL({precision}, {scale})), ARRAY({inputs}))"
+                )
+                self.assertEqual(tree.sql("doris", copy=False), expected)
+                self.assertEqual(tree, before)
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
+                self.validate_identity(expected)
 
     def test_postgres_array_unknown_inputs(self):
         for source, expected in (
@@ -948,7 +1076,11 @@ class TestDoris(Validator):
                 "ARRAY[ARRAY['2147483648', 1], ARRAY[2, 3]]::BIGINT[][]",
                 "CAST(CAST(ARRAY(CAST(ARRAY(CAST('2147483648' AS BIGINT), 1) AS ARRAY<BIGINT>), CAST(ARRAY(2, 3) AS ARRAY<BIGINT>)) AS ARRAY<ARRAY<BIGINT>>) AS ARRAY<ARRAY<BIGINT>>)",
             ),
-            ("ARRAY['1.5', 1]::DECIMAL(10, 2)[]", "CAST(ARRAY('1.5', 1) AS ARRAY<DECIMAL(10, 2)>)"),
+            (
+                "ARRAY['1.5', 1]::DECIMAL(10, 2)[]",
+                "CAST(ARRAY_MAP(_pg_numeric_input -> CAST(_pg_numeric_input AS DECIMAL(10, 2)), "
+                "ARRAY('1.5', '1')) AS ARRAY<DECIMAL(10, 2)>)",
+            ),
         ):
             with self.subTest(source):
                 tree = parse_one(source, read="postgres")

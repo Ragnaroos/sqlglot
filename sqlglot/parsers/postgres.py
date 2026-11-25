@@ -124,12 +124,16 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
             dtype = expression.to
             if dtype and dtype.is_type(*numeric_types, exp.DType.TEXT, exp.DType.BOOLEAN):
                 return dtype.copy()
+            if dtype and dtype.is_type(exp.DType.DECIMAL) and dtype.expressions:
+                return dtype.copy()
         elif isinstance(expression, exp.Boolean):
             return exp.DataType.build(exp.DType.BOOLEAN)
         elif isinstance(expression, exp.Neg):
             dtype = resolve(expression.this)
             if dtype and dtype.is_type(exp.DType.FLOAT, exp.DType.DOUBLE):
                 return dtype
+            if dtype and dtype.is_type(exp.DType.DECIMAL):
+                return exp.DataType.build(exp.DType.DECIMAL)
         elif isinstance(expression, exp.Array):
             dtype = expression.args.get("element_type")
             if dtype:
@@ -154,10 +158,16 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
         return None
 
     def common(left: exp.DataType, right: exp.DataType) -> exp.DataType | None:
-        if left == right or right.is_type(exp.DType.UNKNOWN):
+        if left == right:
             return left
+        if right.is_type(exp.DType.UNKNOWN):
+            return (
+                exp.DataType.build(exp.DType.DECIMAL) if left.is_type(exp.DType.DECIMAL) else left
+            )
         if left.is_type(exp.DType.UNKNOWN):
-            return right
+            return (
+                exp.DataType.build(exp.DType.DECIMAL) if right.is_type(exp.DType.DECIMAL) else right
+            )
         integer_numeric = (exp.DType.SMALLINT, exp.DType.INT, exp.DType.BIGINT, exp.DType.DECIMAL)
         if left.is_type(*integer_numeric) and right.is_type(*integer_numeric):
             if left.is_type(exp.DType.DECIMAL) or right.is_type(exp.DType.DECIMAL):
@@ -178,8 +188,8 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
     types = [resolve(expression) for expression in expressions]
     if any(dtype is None for dtype in types):
         return None
-    result: exp.DataType | None = exp.DataType.build(exp.DType.UNKNOWN)
-    for dtype in types:
+    result: exp.DataType | None = types[0]
+    for dtype in types[1:]:
         if dtype is None:
             return None
         result = common(result, dtype)
@@ -196,6 +206,7 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
         exp.DType.BOOLEAN,
         exp.DType.FLOAT,
         exp.DType.DOUBLE,
+        exp.DType.DECIMAL,
     ):
         return None
     return exp.DataType.build(exp.DType.TEXT) if result.is_type(exp.DType.UNKNOWN) else result
