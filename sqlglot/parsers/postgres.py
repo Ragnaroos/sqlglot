@@ -574,3 +574,31 @@ class PostgresParser(parser.Parser):
             if dtype:
                 expression.set("element_type", dtype)
         return expression
+
+    def _parse_window(self, this: exp.Expr | None, alias: bool = False) -> exp.Expr | None:
+        result = super()._parse_window(this, alias=alias)
+        if isinstance(this, exp.PERCENTILES) and isinstance(this.parent, exp.WithinGroup):
+            probabilities = this.this.unnest()
+            if (
+                isinstance(probabilities, exp.Array)
+                and not probabilities.find(exp.Query, exp.Column, exp.Placeholder)
+                and not any(
+                    cast.to.is_type(exp.DType.ARRAY) for cast in probabilities.find_all(exp.Cast)
+                )
+            ):
+
+                def resolve(array: exp.Array) -> exp.DataType:
+                    element = exp.DataType.build(exp.DType.DOUBLE)
+                    for value in array.expressions:
+                        child = value.unnest()
+                        if isinstance(child, exp.Array):
+                            element = resolve(child)
+                    # Both PG percentile signatures coerce probability arrays
+                    # to float8[], regardless of a NUMERIC constructor's scale.
+                    array.set("element_type", element)
+                    return exp.DataType(
+                        this=exp.DType.ARRAY, expressions=[element.copy()], nested=True
+                    )
+
+                resolve(probabilities)
+        return result
