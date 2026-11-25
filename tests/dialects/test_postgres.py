@@ -85,6 +85,55 @@ class TestPostgres(Validator):
         ):
             self.assertNotIn("ARRAY<DOUBLE>", parse_one(source, read="postgres").sql("doris"))
 
+    def test_text_array_literal(self):
+        for value, elements in (
+            ("{fred,jim,fred}", ["fred", "jim", "fred"]),
+            ("{}", []),
+            (" {  } ", []),
+            ('{NULL,null,"NULL",""}', [None, None, "NULL", ""]),
+            ('{ a , " b " , "a,b" , "{}" }', ["a", " b ", "a,b", "{}"]),
+            (r'{a\,b,a\}b,\NULL,"a\\b","a\"b"}', ["a,b", "a}b", "NULL", "a\\b", 'a"b']),
+            (r'{\ a\ ,"中文",😀}', [" a ", "中文", "😀"]),
+        ):
+            with self.subTest(value=value):
+                for source in (
+                    exp.cast(exp.Literal.string(value), "TEXT[]").sql("postgres"),
+                    exp.Literal.string(value).sql("postgres") + "::TEXT[]",
+                ):
+                    tree = parse_one(source, read="postgres")
+                    self.assertIsInstance(tree.this, exp.Array)
+                    self.assertEqual(
+                        tree.this.expressions,
+                        [
+                            exp.null() if item is None else exp.Literal.string(item)
+                            for item in elements
+                        ],
+                    )
+                    if elements:
+                        self.assertTrue(tree.this.args["element_type"].is_type(exp.DType.TEXT))
+                    self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                    self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
+                    before = tree.copy()
+                    target = tree.sql("doris", copy=False)
+                    self.assertIn("ARRAY", target)
+                    self.assertEqual(tree, before)
+
+    def test_text_array_literal_exclusions(self):
+        for value in (
+            "{a,}",
+            "{,a}",
+            '{"a"b}',
+            '{"a}',
+            "{{a,b},{c,d}}",
+            "[0:1]={a,b}",
+            "{a",
+            "a,b",
+        ):
+            source = exp.cast(exp.Literal.string(value), "TEXT[]").sql("postgres")
+            self.assertTrue(parse_one(source, read="postgres").this.is_string)
+        self.assertIsInstance(parse_one("CAST(x AS TEXT[])", read="postgres").this, exp.Column)
+        self.assertTrue(parse_one("'{1,2}'::INT[]", read="postgres").this.is_string)
+
     def test_sample_aggregate_null_contract(self):
         for function, kind in (
             ("STDDEV", exp.Stddev),
