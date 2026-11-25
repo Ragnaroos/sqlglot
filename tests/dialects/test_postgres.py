@@ -69,7 +69,9 @@ class TestPostgres(Validator):
                         while dtype.is_type(exp.DType.ARRAY):
                             dtype = dtype.expressions[0]
                         self.assertTrue(dtype.is_type(exp.DType.DOUBLE))
-                    target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                    target = tree.find(exp.Array).sql(
+                        "doris", copy=False, unsupported_level=ErrorLevel.RAISE
+                    )
                     self.assertIn("ARRAY<DOUBLE>", target)
                     self.assertEqual(tree, before)
                     self.assertEqual(exp.Expression.load(tree.dump()), tree)
