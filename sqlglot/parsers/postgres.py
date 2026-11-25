@@ -40,13 +40,21 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
             expression = expression.this
         if isinstance(expression, exp.Literal) and expression.is_string:
             return exp.DataType.build(exp.DType.UNKNOWN)
-        if expression.is_int:
-            value = int(expression.to_py())
+        literal = expression.this if isinstance(expression, exp.Neg) else expression
+        if literal.is_number and re.fullmatch(r"[0-9]+", literal.name):
+            digits = literal.name.lstrip("0") or "0"
+            # PostgreSQL promotes larger integer tokens to NUMERIC. Inspect the
+            # token before int() so valid long inputs do not hit Python's limit.
+            if len(digits) > 19:
+                return exp.DataType.build(exp.DType.DECIMAL)
+            value = int(digits) * (-1 if isinstance(expression, exp.Neg) else 1)
             if -(2**31) <= value < 2**31:
                 return exp.DataType.build(exp.DType.INT)
             if -(2**63) <= value < 2**63:
                 return exp.DataType.build(exp.DType.BIGINT)
-            return None
+            return exp.DataType.build(exp.DType.DECIMAL)
+        if literal.is_number:
+            return exp.DataType.build(exp.DType.DECIMAL)
         if isinstance(expression, exp.Cast):
             dtype = expression.to
             if dtype and dtype.is_type(*numeric_types, exp.DType.TEXT, exp.DType.BOOLEAN):
@@ -85,6 +93,10 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
             return left
         if left.is_type(exp.DType.UNKNOWN):
             return right
+        integer_numeric = (exp.DType.SMALLINT, exp.DType.INT, exp.DType.BIGINT, exp.DType.DECIMAL)
+        if left.is_type(*integer_numeric) and right.is_type(*integer_numeric):
+            if left.is_type(exp.DType.DECIMAL) or right.is_type(exp.DType.DECIMAL):
+                return exp.DataType.build(exp.DType.DECIMAL)
         if left.is_type(*numeric_types) and right.is_type(*numeric_types):
             return max((left, right), key=lambda dtype: numeric_types.index(dtype.this))
         if left.is_type(exp.DType.ARRAY) and right.is_type(exp.DType.ARRAY):

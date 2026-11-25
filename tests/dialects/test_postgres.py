@@ -19,6 +19,12 @@ class TestPostgres(Validator):
         for source, dtype in (
             ("ARRAY[1, NULL]", "INT"),
             ("ARRAY[2147483648]", "BIGINT"),
+            ("ARRAY[-9223372036854775808, 9223372036854775807]", "BIGINT"),
+            ("ARRAY[9223372036854775808, NULL, 1]", "DECIMAL"),
+            ("ARRAY[-9223372036854775809, CAST(1 AS BIGINT)]", "DECIMAL"),
+            ("ARRAY[1.25, NULL, -2.00]", "DECIMAL"),
+            ("ARRAY[1E40, 1E-40]", "DECIMAL"),
+            ("ARRAY[ARRAY[9223372036854775808], ARRAY[1]]", "ARRAY<DECIMAL>"),
             ("ARRAY[NULL]", "TEXT"),
             ("ARRAY['a', 'b']", "TEXT"),
             ("ARRAY[CAST(1 AS REAL), '1e2']", "FLOAT"),
@@ -34,6 +40,9 @@ class TestPostgres(Validator):
 
         tree = parse_one("ARRAY[(SELECT 1)]", read="postgres")
         self.assertEqual(tree.args["element_type"], exp.DataType.build("INT"))
+
+        tree = parse_one("ARRAY[" + "9" * 5000 + "]", read="postgres")
+        self.assertEqual(tree.args["element_type"], exp.DataType.build("DECIMAL"))
 
         for dialect, source in (
             ("hive", "ARRAY(1, 2)"),
