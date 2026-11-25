@@ -51,6 +51,38 @@ class TestPostgres(Validator):
         ):
             self.assertNotIn("element_type", parse_one(source, read=dialect).args)
 
+    def test_percentile_probability_array_context(self):
+        for function in ("PERCENTILE_CONT", "PERCENTILE_DISC"):
+            for argument in (
+                "ARRAY[0, 0.25, 0.5, 1]",
+                "ARRAY[ARRAY[NULL, 1, 0.5], ARRAY[0.75, 0.25, NULL]]",
+                "ARRAY[CAST(0.1 AS REAL), 0.25, NULL]",
+            ):
+                with self.subTest(function=function, argument=argument):
+                    tree = parse_one(
+                        f"SELECT {function}({argument}) WITHIN GROUP (ORDER BY x) FROM t",
+                        read="postgres",
+                    )
+                    before = tree.copy()
+                    for array in tree.find_all(exp.Array):
+                        dtype = array.args["element_type"]
+                        while dtype.is_type(exp.DType.ARRAY):
+                            dtype = dtype.expressions[0]
+                        self.assertTrue(dtype.is_type(exp.DType.DOUBLE))
+                    target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                    self.assertIn("ARRAY<DOUBLE>", target)
+                    self.assertEqual(tree, before)
+                    self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                    self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
+
+        plain = parse_one("ARRAY[1.25, 2]", read="postgres")
+        self.assertTrue(plain.args["element_type"].is_type(exp.DType.DECIMAL))
+        for source in (
+            "SELECT PERCENTILE_DISC(ARRAY[x, 0.25]) WITHIN GROUP (ORDER BY y) FROM t",
+            "SELECT PERCENTILE_DISC(ARRAY[ARRAY[1]::NUMERIC[]]) WITHIN GROUP (ORDER BY x) FROM t",
+        ):
+            self.assertNotIn("ARRAY<DOUBLE>", parse_one(source, read="postgres").sql("doris"))
+
     def test_sample_aggregate_null_contract(self):
         for function, kind in (
             ("STDDEV", exp.Stddev),
