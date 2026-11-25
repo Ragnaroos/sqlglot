@@ -403,6 +403,11 @@ class DorisGenerator(MySQLGenerator):
             # overriding the constructor's provisional common type.
             expression = expression.copy()
             self._array_cast_types(t.cast(exp.Array, expression.this.unnest()), expression.to)
+            leaf_type = expression.to
+            while leaf_type.is_type(exp.DType.ARRAY):
+                leaf_type = leaf_type.expressions[0]
+            if leaf_type.is_type(exp.DType.DECIMAL) and not leaf_type.expressions:
+                return self.sql(expression.this)
         return super().cast_sql(expression, safe_prefix=safe_prefix)
 
     def _array_cast_types(self, array: exp.Array, dtype: exp.DataType) -> None:
@@ -419,8 +424,8 @@ class DorisGenerator(MySQLGenerator):
                 exp.DType.BIGINT,
                 exp.DType.FLOAT,
                 exp.DType.DOUBLE,
+                exp.DType.DECIMAL,
             )
-            or (element.is_type(exp.DType.DECIMAL) and element.expressions)
             else None,
         )
         if element.is_type(exp.DType.ARRAY):

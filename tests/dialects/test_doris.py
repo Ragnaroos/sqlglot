@@ -928,6 +928,27 @@ class TestDoris(Validator):
             with self.subTest(source), self.assertRaises(UnsupportedError):
                 parse_one(source, read="postgres").sql("doris", unsupported_level=ErrorLevel.RAISE)
 
+    def test_postgres_unconstrained_numeric_array_cast(self):
+        for source, precision, scale, inputs in (
+            ("ARRAY['1.25','2.00']::NUMERIC[]", 3, 2, "'1.25', '2.00'"),
+            ("ARRAY[1e40,2]::NUMERIC[]", 41, 0, "'" + "1" + "0" * 40 + "', '2'"),
+            ("ARRAY[NULL,NULL]::NUMERIC[]", 1, 0, "CAST(NULL AS STRING), CAST(NULL AS STRING)"),
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                expected = (
+                    "ARRAY_MAP(_pg_numeric_input -> CAST(_pg_numeric_input AS "
+                    f"DECIMAL({precision}, {scale})), ARRAY({inputs}))"
+                )
+                self.assertEqual(tree.sql("doris", copy=False), expected)
+                self.assertEqual(tree, before)
+                self.validate_identity(expected)
+        with self.assertRaises(UnsupportedError):
+            parse_one("ARRAY['1.25','2']::NUMERIC[]", read="postgres").sql(
+                "doris", unsupported_level=ErrorLevel.RAISE
+            )
+
     def test_postgres_numeric_cast_elements(self):
         for source in (
             "ARRAY[123456789012345678901234567890123456789::NUMERIC(40,0),2::NUMERIC(40,0)]",
