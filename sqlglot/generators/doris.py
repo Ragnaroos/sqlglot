@@ -82,6 +82,81 @@ class DorisGenerator(MySQLGenerator):
         dialect="mysql",
     )
 
+    def withingroup_sql(self, expression: exp.WithinGroup) -> str:
+        aggregate = expression.this
+        if not isinstance(aggregate, exp.PercentileCont) or not isinstance(
+            aggregate.this, exp.Array
+        ):
+            return super().withingroup_sql(expression)
+
+        order = expression.expression
+        context = expression.find_ancestor(exp.Filter, exp.Window, exp.Select)
+        supported = (
+            not isinstance(context, (exp.Filter, exp.Window))
+            and isinstance(order, exp.Order)
+            and len(order.expressions) == 1
+        )
+        value = order.expressions[0].this if supported else None
+        key = value.unnest() if value is not None else None
+        while type(key) is exp.Cast and key.to.is_type(*exp.DataType.NUMERIC_TYPES):
+            key = key.this.unnest()
+        supported = supported and isinstance(key, exp.Column)
+
+        for array in aggregate.this.find_all(exp.Array):
+            if not array.expressions:
+                supported = False
+            for probability in array.expressions:
+                probability = probability.unnest()
+                if isinstance(probability, exp.Array):
+                    continue
+                sign = 1
+                if isinstance(probability, exp.Neg):
+                    probability = probability.this
+                    sign = -1
+                # This only checks the supported syntax, not the NULL result.
+                if isinstance(probability, exp.Literal) and probability.is_number:
+                    if not 0 <= sign * probability.to_py() <= 1:
+                        supported = False
+                elif not isinstance(probability, exp.Null):
+                    supported = False
+
+        if not supported or value is None:
+            self.unsupported(
+                "Doris percentile arrays require nonempty literal probabilities in [0, 1] "
+                "or NULL, one numeric column optionally CAST, and no FILTER or OVER"
+            )
+            return super().withingroup_sql(expression)
+
+        value = exp.cast(value.copy(), exp.DType.DOUBLE)
+        descending = order.expressions[0].args.get("desc")
+        ordered_value = exp.Neg(this=value.copy()) if descending else value.copy()
+
+        def expand(array: exp.Array) -> exp.Array:
+            items = []
+            for probability in array.expressions:
+                child = probability.unnest()
+                if isinstance(child, exp.Array):
+                    items.append(expand(child))
+                    continue
+                p = exp.cast(probability.copy(), exp.DType.DOUBLE)
+                result = exp.func(
+                    "PERCENTILE",
+                    ordered_value.copy(),
+                    exp.Coalesce(this=p.copy(), expressions=[exp.Literal.number(0)]),
+                )
+                if descending:
+                    result = exp.Neg(this=result)
+                items.append(exp.If(this=p.is_(exp.null()), true=exp.null(), false=result))
+            return exp.Array(expressions=items)
+
+        return self.sql(
+            exp.If(
+                this=exp.Count(this=value).eq(0),
+                true=exp.null(),
+                false=expand(aggregate.this),
+            )
+        )
+
     def regrcount_sql(self, expression: exp.RegrCount) -> str:
         args = (expression.this, expression.expression)
         context = expression.find_ancestor(exp.Window, exp.Filter, exp.WithinGroup, exp.Select)

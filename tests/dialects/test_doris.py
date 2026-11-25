@@ -7,6 +7,47 @@ from tests.dialects.test_dialect import Validator
 class TestDoris(Validator):
     dialect = "doris"
 
+    def test_percentile_cont_array(self):
+        source = "SELECT PERCENTILE_CONT(ARRAY[0.5, NULL]) WITHIN GROUP (ORDER BY x) AS xs FROM t"
+        expected = (
+            "SELECT IF(COUNT(CAST(x AS DOUBLE)) = 0, NULL, ARRAY("
+            "IF(CAST(0.5 AS DOUBLE) IS NULL, NULL, PERCENTILE(CAST(x AS DOUBLE), "
+            "COALESCE(CAST(0.5 AS DOUBLE), 0))), "
+            "IF(CAST(NULL AS DOUBLE) IS NULL, NULL, PERCENTILE(CAST(x AS DOUBLE), "
+            "COALESCE(CAST(NULL AS DOUBLE), 0))))) AS xs FROM t"
+        )
+        self.validate_all(expected, read={"postgres": source})
+        self.validate_identity(expected)
+        for probabilities in ("ARRAY[0, 0.5, 0.5, 1]", "ARRAY[[NULL, 1], [0.5, NULL]]"):
+            for key in ("x", "CAST(x AS DOUBLE)", 't."X" DESC NULLS FIRST'):
+                source = f"SELECT PERCENTILE_CONT({probabilities}) WITHIN GROUP (ORDER BY {key}) AS xs FROM t"
+                tree = parse_one(source, read="postgres")
+                original = tree.copy()
+                result = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree, original)
+                self.assertNotIn("WITHIN GROUP", result)
+                self.assertNotIn("ARRAY_MAP", result)
+                self.validate_identity(result)
+                self.assertEqual(tree.sql("postgres"), original.sql("postgres"))
+
+    def test_percentile_cont_array_exclusions(self):
+        for source in (
+            "SELECT PERCENTILE_CONT(ARRAY[p]) WITHIN GROUP (ORDER BY x) FROM t",
+            "SELECT PERCENTILE_CONT(ARRAY[0.5]) WITHIN GROUP (ORDER BY RANDOM()) FROM t",
+            "SELECT PERCENTILE_CONT(ARRAY[0.5]) WITHIN GROUP (ORDER BY CAST(x AS INTERVAL)) FROM t",
+            "SELECT PERCENTILE_CONT(ARRAY[0.5]) WITHIN GROUP (ORDER BY x, y) FROM t",
+            "SELECT PERCENTILE_CONT(ARRAY[-0.1]) WITHIN GROUP (ORDER BY x) FROM t",
+            "SELECT PERCENTILE_CONT(ARRAY[1.1]) WITHIN GROUP (ORDER BY x) FROM t",
+            "SELECT PERCENTILE_CONT(ARRAY[0.5]) WITHIN GROUP (ORDER BY x) FILTER(WHERE p) FROM t",
+            "SELECT PERCENTILE_CONT(ARRAY[0.5]) WITHIN GROUP (ORDER BY x) OVER() FROM t",
+        ):
+            with self.subTest(source):
+                with self.assertRaises(UnsupportedError):
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    )
+        self.validate_identity("SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x) FROM t")
+
     def test_regr_count(self):
         for source, expected in (
             (
