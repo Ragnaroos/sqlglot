@@ -42,6 +42,7 @@ class DorisParser(MySQLParser):
     FUNCTIONS = {
         **MySQLParser.FUNCTIONS,
         "ADDDATE": build_date_delta_with_interval(exp.DateAdd, default_unit="DAY"),
+        "ARRAY": lambda args: exp.Array(expressions=args, value_constructor=True),
         "COLLECT_SET": exp.ArrayUniqueAgg.from_arg_list,
         "DATE_ADD": build_date_delta_with_interval(exp.DateAdd, default_unit="DAY"),
         "DATE_SUB": build_date_delta_with_interval(exp.DateSub, default_unit="DAY"),
