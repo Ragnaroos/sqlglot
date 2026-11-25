@@ -206,6 +206,7 @@ def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
         exp.DType.BOOLEAN,
         exp.DType.FLOAT,
         exp.DType.DOUBLE,
+        exp.DType.DECIMAL,
     ):
         return None
     return exp.DataType.build(exp.DType.TEXT) if result.is_type(exp.DType.UNKNOWN) else result

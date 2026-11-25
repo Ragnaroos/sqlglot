@@ -58,15 +58,13 @@ class TestPostgres(Validator):
             ("ARRAY[1.20::NUMERIC(6,2),NULL]", "DECIMAL"),
             ("ARRAY[1.20::NUMERIC(6,2),2.00::NUMERIC(10,2)]", "DECIMAL"),
             ("ARRAY[-CAST(1e40 AS NUMERIC(50,0))]", "DECIMAL"),
+            ("ARRAY[1.20::NUMERIC(6,2),'2.345']", "DECIMAL"),
         ):
             with self.subTest(source):
                 tree = parse_one(source, read="postgres")
                 self.assertEqual(tree.args["element_type"].sql(), expected)
                 self.assertEqual(exp.Expression.load(tree.dump()), tree)
                 self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
-        self.assertNotIn(
-            "element_type", parse_one("ARRAY[1.20::NUMERIC(6,2),'2.345']", read="postgres").args
-        )
 
     def test_percentile_probability_array_context(self):
         for function in ("PERCENTILE_CONT", "PERCENTILE_DISC"):

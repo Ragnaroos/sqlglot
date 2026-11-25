@@ -479,16 +479,12 @@ class DorisGenerator(MySQLGenerator):
             leaf_type = leaf_type.expressions[0]
         fixed = bool(leaf_type.expressions)
 
-        def number_input(
-            value: exp.Expr, numeric_string: bool = False
-        ) -> tuple[str, int, int] | None:
+        def number_input(value: exp.Expr) -> tuple[str, int, int] | None:
             literal = value.this if isinstance(value, exp.Neg) else value
             text = literal.name.strip(" \t\n\r\f\v")
-            if (
-                (fixed or numeric_string)
-                and literal.is_string
-                and _PG_INTEGER_INPUT.fullmatch(text)
-            ):
+            if len(text) > 4096:
+                return None
+            if literal.is_string and _PG_INTEGER_INPUT.fullmatch(text):
                 unsigned = text.lstrip("+-").lower().replace("_", "")
                 base = {"0x": 16, "0o": 8, "0b": 2}.get(unsigned[:2], 10)
                 digits = (unsigned if base == 10 else unsigned[2:]).lstrip("0") or "0"
@@ -497,11 +493,7 @@ class DorisGenerator(MySQLGenerator):
                 text = str(int(digits, base) * (-1 if text.startswith("-") else 1))
             if (
                 literal.is_number
-                or (
-                    (fixed or numeric_string)
-                    and literal.is_string
-                    and _PG_DECIMAL_NUMERIC_INPUT.fullmatch(text)
-                )
+                or (literal.is_string and _PG_DECIMAL_NUMERIC_INPUT.fullmatch(text))
             ) and len(text) <= 4096:
                 try:
                     number = Decimal(text.replace("_", ""))
@@ -619,7 +611,7 @@ class DorisGenerator(MySQLGenerator):
                 return value.copy()
             inner = value.this.unnest()
             if inner.is_number or inner.is_string:
-                number = number_input(inner, numeric_string=True)
+                number = number_input(inner)
                 if number is None:
                     self.unsupported("Doris cannot preserve this PostgreSQL NUMERIC input")
                     return value.copy()
