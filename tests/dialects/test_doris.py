@@ -5,6 +5,70 @@ from tests.dialects.test_dialect import Validator
 class TestDoris(Validator):
     dialect = "doris"
 
+    def test_array_agg_nulls_and_empty_input(self):
+        for source, expected in (
+            ("SELECT ARRAY_AGG(a) FROM t", "SELECT NULLIF(ARRAY_AGG(a), ARRAY()) FROM t"),
+            (
+                "SELECT ARRAY_AGG(DISTINCT a) FROM t",
+                "SELECT NULLIF(ARRAY_AGG(DISTINCT a), ARRAY()) FROM t",
+            ),
+            (
+                "SELECT ARRAY_AGG(CAST(a AS BIGINT)) AS xs FROM t WHERE FALSE",
+                "SELECT NULLIF(ARRAY_AGG(CAST(a AS BIGINT)), ARRAY()) AS xs FROM t WHERE FALSE",
+            ),
+            (
+                "SELECT g, ARRAY_AGG(a) AS xs, ARRAY_AGG(b) AS ys FROM t GROUP BY g",
+                "SELECT g, NULLIF(ARRAY_AGG(a), ARRAY()) AS xs, NULLIF(ARRAY_AGG(b), ARRAY()) AS ys FROM t GROUP BY g",
+            ),
+            (
+                "SELECT g FROM t GROUP BY g HAVING ARRAY_AGG(a) IS NULL",
+                "SELECT g FROM t GROUP BY g HAVING NULLIF(ARRAY_AGG(a), ARRAY()) IS NULL",
+            ),
+            (
+                "SELECT (SELECT ARRAY_AGG(a) FROM t WHERE FALSE) AS xs",
+                "SELECT (SELECT NULLIF(ARRAY_AGG(a), ARRAY()) FROM t WHERE FALSE) AS xs",
+            ),
+        ):
+            with self.subTest(source):
+                self.validate_all(expected, read={"postgres": source}, write={"doris": expected})
+                self.assertEqual(
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    ),
+                    expected,
+                )
+                self.validate_identity(expected)
+
+        self.validate_identity("SELECT ARRAY_AGG(a) FROM t")
+        self.validate_identity("SELECT COLLECT_LIST(a) FROM t")
+        self.validate_all(
+            "SELECT COLLECT_LIST(a) FROM t",
+            read={
+                "hive": "SELECT COLLECT_LIST(a) FROM t",
+                "spark": "SELECT COLLECT_LIST(a) FROM t",
+            },
+        )
+
+    def test_array_agg_excluded_contexts(self):
+        for source, expected in (
+            (
+                "SELECT ARRAY_AGG(a ORDER BY b) FROM t",
+                "SELECT COLLECT_LIST(a ORDER BY b NULLS LAST) FROM t",
+            ),
+            ("SELECT ARRAY_AGG(a) OVER () FROM t", "SELECT COLLECT_LIST(a) OVER () FROM t"),
+            (
+                "SELECT ARRAY_AGG(a) FILTER(WHERE p) FROM t",
+                "SELECT COLLECT_LIST(a) FILTER(WHERE p) FROM t",
+            ),
+        ):
+            with self.subTest(source):
+                self.assertEqual(
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    ),
+                    expected,
+                )
+
     def test_null_ordering(self):
         for source, expected in (
             ("SELECT a FROM t ORDER BY 1", "SELECT a FROM t ORDER BY 1 NULLS LAST"),

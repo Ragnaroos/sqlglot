@@ -11,6 +11,18 @@ class TestPostgres(Validator):
     maxDiff = None
     dialect = "postgres"
 
+    def test_array_agg_empty_input_contract(self):
+        for sql, mysql_sql in (
+            ("SELECT ARRAY_AGG(a) FROM t", "SELECT GROUP_CONCAT(a) FROM t"),
+            ("SELECT ARRAY_AGG(DISTINCT a) FROM t", "SELECT GROUP_CONCAT(DISTINCT a) FROM t"),
+        ):
+            with self.subTest(sql):
+                aggregate = self.validate_identity(sql).find(exp.ArrayAgg)
+                self.assertIsNotNone(aggregate)
+                self.assertIs(aggregate.args.get("null_on_empty"), True)
+                self.assertFalse(aggregate.args.get("nulls_excluded"))
+                self.assertEqual(parse_one(sql, read="postgres").sql("mysql"), mysql_sql)
+
     def test_convert(self):
         self.validate_identity(
             "SELECT ENCODE(CONVERT(DECODE('6162', 'hex'), 'UTF8', 'UTF8'), 'hex')"
