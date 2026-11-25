@@ -12,6 +12,7 @@ from sqlglot.dialects.dialect import (
     weekstart_unit_to_str,
 )
 from sqlglot.generators.mysql import MySQLGenerator
+from sqlglot.optimizer.annotate_types import annotate_types
 
 
 def _lag_lead_sql(self, expression: exp.Lag | exp.Lead) -> str:
@@ -60,6 +61,113 @@ def _sample_aggregate_sql(
 
 
 class DorisGenerator(MySQLGenerator):
+    INTEGER_SERIES_LENGTH = exp.maybe_parse(
+        "CASE WHEN :start IS NULL OR :end IS NULL OR :step IS NULL THEN 0 "
+        "WHEN (:step > 0 AND :start <= :end) OR (:step < 0 AND :start >= :end) "
+        "THEN (CAST(:end AS BIGINT) - CAST(:start AS BIGINT)) DIV NULLIF(:step, 0) + 1 "
+        "ELSE 0 END",
+        dialect="mysql",
+    )
+
+    def table_sql(self, expression: exp.Table, sep: str = " AS ") -> str:
+        ancestor = expression.find_ancestor(exp.Update, exp.Delete, exp.Select)
+        if not isinstance(ancestor, exp.Select):
+            sep = " "
+        series = expression.this
+        if not isinstance(series, exp.ExplodingGenerateSeries):
+            return super().table_sql(expression, sep=sep)
+
+        args = [series.args.get(key) for key in ("start", "end", "step")]
+        args[2] = args[2] if args[2] is not None else exp.Literal.number(1)
+        args = [arg.unnest() if arg is not None else None for arg in args]
+        alias = expression.args.get("alias")
+        if (
+            any(arg is None for arg in args)
+            or any(expression.args.get(key) for key in ("catalog", "db", "ordinality"))
+            or series.args.get("is_end_exclusive")
+            or (alias and len(alias.columns) > 1)
+        ):
+            return super().table_sql(expression, sep=sep)
+
+        constants = []
+        for arg in args:
+            constant = arg
+            while isinstance(constant, exp.Cast) and constant.to.is_type(exp.DType.INT):
+                constant = constant.this.unnest()
+            if constant.is_int:
+                value = constant.to_py()
+                if value < -(2**31) or value >= 2**31:
+                    return super().table_sql(expression, sep=sep)
+            elif (
+                not constant.is_leaf()
+                or isinstance(constant, exp.Func)
+                or not annotate_types(
+                    exp.Coalesce(this=constant.copy(), expressions=[exp.Literal.number(1)]),
+                    dialect="postgres",
+                ).is_type(exp.DType.INT)
+            ):
+                return super().table_sql(expression, sep=sep)
+            constants.append(constant)
+
+        name = alias.this.copy() if alias and alias.this else exp.to_identifier("generate_series")
+        column = alias.columns[0].copy() if alias and alias.columns else name.copy()
+        query = exp.select()
+        if all(arg.is_int for arg in constants):
+            start, end, step = (arg.to_py() for arg in constants)
+            if not step:
+                return super().table_sql(expression, sep=sep)
+            # NUMBERS requires a string literal, not a runtime length expression.
+            count = max(0, (end - start) // step + 1)
+            query = query.from_(
+                exp.Table(
+                    this=exp.func(
+                        "NUMBERS",
+                        exp.EQ(
+                            this=exp.Literal.string("number"),
+                            expression=exp.Literal.string(str(count)),
+                        ),
+                    )
+                )
+            )
+            start, step = exp.convert(start), exp.convert(step)
+            number = exp.column("number")
+        else:
+            # Eligibility is type-based; NULL semantics remain in the runtime CASE.
+            start, end, step = (arg.copy() for arg in args)
+            length = exp.replace_placeholders(
+                self.INTEGER_SERIES_LENGTH.copy(), start=start, end=end, step=step
+            )
+            query = query.from_(
+                exp.select(exp.alias_(exp.Literal.number(1), "seed")).subquery("_series")
+            )
+            query.set(
+                "laterals",
+                [
+                    exp.Lateral(
+                        this=exp.func("EXPLODE_NUMBERS", length),
+                        view=True,
+                        alias=exp.TableAlias(
+                            this=exp.to_identifier("_numbers"),
+                            columns=[exp.to_identifier("number")],
+                        ),
+                    )
+                ],
+            )
+            number = exp.column("number", table="_numbers")
+        value = exp.Add(this=start, expression=exp.Mul(this=number, expression=step))
+        query = query.select(exp.alias_(exp.cast(value, exp.DType.INT), column))
+        table = expression.copy()
+        table.set("this", exp.Subquery(this=query))
+        table.set("alias", exp.TableAlias(this=name))
+        return super().table_sql(table, sep=sep)
+
+    def explodinggenerateseries_sql(self, expression: exp.ExplodingGenerateSeries) -> str:
+        self.unsupported(
+            "Doris GENERATE_SERIES requires constant INT-compatible table arguments without "
+            "LATERAL or WITH ORDINALITY; zero step on non-NULL inputs is unsupported"
+        )
+        return super().explodinggenerateseries_sql(expression)
+
     def filter_sql(self, expression: exp.Filter) -> str:
         aggregate = expression.this
         if (
@@ -754,10 +862,3 @@ class DorisGenerator(MySQLGenerator):
         if isinstance(this, exp.Schema):
             return f"PARTITION BY ({self.expressions(this, flat=True)})"
         return f"PARTITION BY ({self.sql(this)})"
-
-    def table_sql(self, expression: exp.Table, sep: str = " AS ") -> str:
-        """Override table_sql to avoid AS keyword in UPDATE and DELETE statements."""
-        ancestor = expression.find_ancestor(exp.Update, exp.Delete, exp.Select)
-        if not isinstance(ancestor, exp.Select):
-            sep = " "
-        return super().table_sql(expression, sep=sep)
