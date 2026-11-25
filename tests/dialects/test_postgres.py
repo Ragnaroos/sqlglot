@@ -11,6 +11,33 @@ class TestPostgres(Validator):
     maxDiff = None
     dialect = "postgres"
 
+    def test_array_element_type_contract(self):
+        with self.assertRaises(ParseError):
+            parse_one(
+                "SELECT ARRAY[1::NUMERIC(3, -1)]", read="postgres", error_level=ErrorLevel.RAISE
+            )
+        for source, dtype in (
+            ("ARRAY[1, NULL]", "INT"),
+            ("ARRAY[2147483648]", "BIGINT"),
+            ("ARRAY[NULL]", "TEXT"),
+            ("ARRAY['a', 'b']", "TEXT"),
+        ):
+            with self.subTest(source):
+                tree = self.validate_identity(source)
+                self.assertEqual(tree.args["element_type"], exp.DataType.build(dtype))
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+                self.assertEqual(parse_one(tree.sql("postgres"), read="postgres"), tree)
+
+        tree = parse_one("ARRAY[(SELECT 1)]", read="postgres")
+        self.assertEqual(tree.args["element_type"], exp.DataType.build("INT"))
+
+        for dialect, source in (
+            ("hive", "ARRAY(1, 2)"),
+            ("doris", "ARRAY(1, 2)"),
+            ("bigquery", "[1, 2]"),
+        ):
+            self.assertNotIn("element_type", parse_one(source, read=dialect).args)
+
     def test_sample_aggregate_null_contract(self):
         for function, kind in (
             ("STDDEV", exp.Stddev),

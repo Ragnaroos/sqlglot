@@ -288,6 +288,18 @@ class DorisGenerator(MySQLGenerator):
             and not expression.args.get("value_constructor")
         ):
             self.unsupported("Doris does not support ARRAY subquery constructors")
+        element_type = expression.args.get("element_type")
+        if element_type:
+            array = expression.copy()
+            array.set("element_type", None)
+            return super().cast_sql(
+                exp.cast(
+                    array,
+                    exp.DataType(
+                        this=exp.DType.ARRAY, expressions=[element_type.copy()], nested=True
+                    ),
+                )
+            )
         return self.func("ARRAY", *expressions)
 
     def match_sql(self, expression: exp.Match) -> str:

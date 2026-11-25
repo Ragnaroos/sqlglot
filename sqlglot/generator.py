@@ -5065,6 +5065,9 @@ class Generator:
 
         return self.function_fallback_sql(expression)
 
+    def array_sql(self, expression: exp.Array) -> str:
+        return self.func(self.function_name(expression), *expression.expressions)
+
     def function_fallback_sql(self, expression: exp.Func) -> str:
         args = []
 

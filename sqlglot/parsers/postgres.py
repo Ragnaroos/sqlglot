@@ -12,6 +12,7 @@ from sqlglot.dialects.dialect import (
     build_timestamp_trunc,
 )
 from sqlglot.helper import is_int, seq_get
+from sqlglot.optimizer.annotate_types import annotate_types
 from sqlglot.parser import IsPredicatePrecedence, binary_range_parser
 from sqlglot.tokens import TokenType
 
@@ -20,6 +21,96 @@ if t.TYPE_CHECKING:
 
 
 SIMPLE_INTERVAL_RE = re.compile(r"\s*(?:[+-]?\s*[0-9]+(?:\.[0-9]*)?|\.[0-9]+)\s*[a-zA-Z]+\s*")
+
+
+def _array_element_type(expressions: list[exp.Expr]) -> exp.DataType | None:
+    # Resolve only types established by the source expression. PostgreSQL's unknown
+    # literals become TEXT only when no known input type is present. This is type
+    # resolution, not evaluation or folding of NULL values.
+    numeric_types = (
+        exp.DType.SMALLINT,
+        exp.DType.INT,
+        exp.DType.BIGINT,
+        exp.DType.FLOAT,
+        exp.DType.DOUBLE,
+    )
+
+    def resolve(expression: exp.Expr) -> exp.DataType | None:
+        while isinstance(expression, exp.Paren):
+            expression = expression.this
+        if isinstance(expression, exp.Literal) and expression.is_string:
+            return exp.DataType.build(exp.DType.UNKNOWN)
+        if expression.is_int:
+            value = int(expression.to_py())
+            if -(2**31) <= value < 2**31:
+                return exp.DataType.build(exp.DType.INT)
+            if -(2**63) <= value < 2**63:
+                return exp.DataType.build(exp.DType.BIGINT)
+            return None
+        if isinstance(expression, exp.Cast):
+            dtype = expression.to
+            if dtype and dtype.is_type(*numeric_types, exp.DType.TEXT, exp.DType.BOOLEAN):
+                return dtype.copy()
+        elif isinstance(expression, exp.Boolean):
+            return exp.DataType.build(exp.DType.BOOLEAN)
+        elif isinstance(expression, exp.Array):
+            dtype = expression.args.get("element_type")
+            if dtype:
+                return exp.DataType(this=exp.DType.ARRAY, expressions=[dtype.copy()], nested=True)
+        elif isinstance(expression, exp.Subquery) and isinstance(expression.this, exp.Select):
+            projections = expression.this.expressions
+            if len(projections) == 1:
+                dtype = resolve(projections[0].unalias())
+                # A SELECT output resolves unknown literals before its enclosing ARRAY.
+                if dtype and dtype.is_type(exp.DType.UNKNOWN):
+                    return exp.DataType.build(exp.DType.TEXT)
+                return dtype
+        if (
+            expression.is_leaf()
+            and not isinstance(expression, exp.Func)
+            and annotate_types(
+                exp.Coalesce(this=expression.copy(), expressions=[exp.Literal.number(1)]),
+                dialect="postgres",
+            ).is_type(exp.DType.INT)
+        ):
+            return exp.DataType.build(exp.DType.UNKNOWN)
+        return None
+
+    def common(left: exp.DataType, right: exp.DataType) -> exp.DataType | None:
+        if left == right or right.is_type(exp.DType.UNKNOWN):
+            return left
+        if left.is_type(exp.DType.UNKNOWN):
+            return right
+        if left.is_type(*numeric_types) and right.is_type(*numeric_types):
+            return max((left, right), key=lambda dtype: numeric_types.index(dtype.this))
+        if left.is_type(exp.DType.ARRAY) and right.is_type(exp.DType.ARRAY):
+            element = common(
+                t.cast(exp.DataType, left.expressions[0]),
+                t.cast(exp.DataType, right.expressions[0]),
+            )
+            if element:
+                return exp.DataType(this=exp.DType.ARRAY, expressions=[element], nested=True)
+        return None
+
+    if not expressions:
+        return None
+    types = [resolve(expression) for expression in expressions]
+    if any(dtype is None for dtype in types):
+        return None
+    result: exp.DataType | None = exp.DataType.build(exp.DType.UNKNOWN)
+    for dtype in types:
+        if dtype is None:
+            return None
+        result = common(result, dtype)
+        if result is None:
+            return None
+    # Only enable source input conversions supplied by the Doris generator.
+    if any(expression.unnest().is_string for expression in expressions) and not result.is_type(
+        exp.DType.UNKNOWN,
+        exp.DType.TEXT,
+    ):
+        return None
+    return exp.DataType.build(exp.DType.TEXT) if result.is_type(exp.DType.UNKNOWN) else result
 
 
 MAKE_INTERVAL_KWARGS = {
@@ -452,3 +543,11 @@ class PostgresParser(parser.Parser):
                 udt_type = exp.Dot(this=udt_type, expression=part)
 
         return exp.DataType.build(udt_type, udt=True)
+
+    def _parse_bracket(self, this: exp.Expr | None = None) -> exp.Expr | None:
+        expression = super()._parse_bracket(this)
+        if isinstance(expression, exp.Array) and "element_type" not in expression.args:
+            dtype = _array_element_type(expression.expressions)
+            if dtype:
+                expression.set("element_type", dtype)
+        return expression
