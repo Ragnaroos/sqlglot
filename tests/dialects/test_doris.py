@@ -892,6 +892,39 @@ class TestDoris(Validator):
             with self.subTest(source), self.assertRaises(UnsupportedError):
                 parse_one(source, read="postgres").sql("doris", unsupported_level=ErrorLevel.RAISE)
 
+    def test_postgres_fixed_numeric_array_cast(self):
+        for values, precision, scale, inputs in (
+            ("1e40, 2", 50, 0, "'" + "1" + "0" * 40 + "', '2'"),
+            ("1.25, 2", 10, 2, "'1.25', '2'"),
+            ("'1.235', '-2.345', NULL", 6, 2, "'1.235', '-2.345', CAST(NULL AS STRING)"),
+            ("'0x10', '0b11', '0o17'", 6, 2, "'16', '3', '15'"),
+            ("'1_2.3_4', '+1.2e+1_0'", 20, 2, "'12.34', '12000000000'"),
+            ("NULL, NULL", 40, 0, "CAST(NULL AS STRING), CAST(NULL AS STRING)"),
+            ("1e-76, NULL", 76, 76, "'0." + "0" * 75 + "1', CAST(NULL AS STRING)"),
+        ):
+            with self.subTest(values=values):
+                tree = parse_one(
+                    f"SELECT ARRAY[{values}]::NUMERIC({precision},{scale})[] AS xs",
+                    read="postgres",
+                )
+                before = tree.copy()
+                expected = (
+                    "SELECT CAST(ARRAY_MAP(_pg_numeric_input -> CAST(_pg_numeric_input AS "
+                    f"DECIMAL({precision}, {scale})), ARRAY({inputs})) AS "
+                    f"ARRAY<DECIMAL({precision}, {scale})>) AS xs"
+                )
+                self.assertEqual(tree.sql("doris", copy=False), expected)
+                self.assertEqual(tree, before)
+                self.validate_identity(expected)
+                self.assertEqual(exp.Expression.load(tree.dump()), tree)
+        self.assertIn(
+            "ARRAY_MAP(_pg_numeric_input_1",
+            parse_one("ARRAY[[1e40,2],[3,NULL]]::NUMERIC(50,0)[][]", read="postgres").sql("doris"),
+        )
+        for source in ("ARRAY[1e40,2]::NUMERIC(77,0)[]", "ARRAY[0.0125]::NUMERIC(2,3)[]"):
+            with self.subTest(source), self.assertRaises(UnsupportedError):
+                parse_one(source, read="postgres").sql("doris", unsupported_level=ErrorLevel.RAISE)
+
     def test_postgres_array_unknown_inputs(self):
         for source, expected in (
             ("ARRAY['1', 2, NULL]", "CAST(ARRAY(CAST('1' AS INT), 2, NULL) AS ARRAY<INT>)"),
@@ -948,7 +981,11 @@ class TestDoris(Validator):
                 "ARRAY[ARRAY['2147483648', 1], ARRAY[2, 3]]::BIGINT[][]",
                 "CAST(CAST(ARRAY(CAST(ARRAY(CAST('2147483648' AS BIGINT), 1) AS ARRAY<BIGINT>), CAST(ARRAY(2, 3) AS ARRAY<BIGINT>)) AS ARRAY<ARRAY<BIGINT>>) AS ARRAY<ARRAY<BIGINT>>)",
             ),
-            ("ARRAY['1.5', 1]::DECIMAL(10, 2)[]", "CAST(ARRAY('1.5', 1) AS ARRAY<DECIMAL(10, 2)>)"),
+            (
+                "ARRAY['1.5', 1]::DECIMAL(10, 2)[]",
+                "CAST(ARRAY_MAP(_pg_numeric_input -> CAST(_pg_numeric_input AS DECIMAL(10, 2)), "
+                "ARRAY('1.5', '1')) AS ARRAY<DECIMAL(10, 2)>)",
+            ),
         ):
             with self.subTest(source):
                 tree = parse_one(source, read="postgres")

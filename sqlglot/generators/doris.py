@@ -22,6 +22,10 @@ _PG_INTEGER_INPUT = re.compile(
     r"|0[oO]_?[0-7](?:_?[0-7])*|0[bB]_?[01](?:_?[01])*)"
 )
 _PG_DECIMAL_FLOAT_INPUT = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+_PG_DECIMAL_NUMERIC_INPUT = re.compile(
+    r"[+-]?(?:[0-9](?:_?[0-9])*(?:\.(?:[0-9](?:_?[0-9])*)?)?"
+    r"|\.[0-9](?:_?[0-9])*)(?:[eE][+-]?[0-9](?:_?[0-9])*)?"
+)
 _PG_HEX_FLOAT_INPUT = re.compile(
     r"([+-]?)0[xX]([0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?|\.[0-9a-fA-F]+)"
     r"(?:[pP]([+-]?[0-9]+))?"
@@ -416,6 +420,7 @@ class DorisGenerator(MySQLGenerator):
                 exp.DType.FLOAT,
                 exp.DType.DOUBLE,
             )
+            or (element.is_type(exp.DType.DECIMAL) and element.expressions)
             else None,
         )
         if element.is_type(exp.DType.ARRAY):
@@ -469,12 +474,27 @@ class DorisGenerator(MySQLGenerator):
         # The PG hint establishes NUMERIC, not a fabricated source typmod.
         # Only finite domains with a provable target width/scale are portable.
         widths = {exp.DType.SMALLINT: 5, exp.DType.INT: 10, exp.DType.BIGINT: 19}
+        leaf_type = expression.args["element_type"]
+        while leaf_type.is_type(exp.DType.ARRAY):
+            leaf_type = leaf_type.expressions[0]
+        fixed = bool(leaf_type.expressions)
 
         def number_input(value: exp.Expr) -> tuple[str, int, int] | None:
             literal = value.this if isinstance(value, exp.Neg) else value
-            if literal.is_number and len(literal.name) <= 4096:
+            text = literal.name.strip(" \t\n\r\f\v")
+            if fixed and literal.is_string and _PG_INTEGER_INPUT.fullmatch(text):
+                unsigned = text.lstrip("+-").lower().replace("_", "")
+                base = {"0x": 16, "0o": 8, "0b": 2}.get(unsigned[:2], 10)
+                digits = (unsigned if base == 10 else unsigned[2:]).lstrip("0") or "0"
+                if len(digits) > 253:
+                    return None
+                text = str(int(digits, base) * (-1 if text.startswith("-") else 1))
+            if (
+                literal.is_number
+                or (fixed and literal.is_string and _PG_DECIMAL_NUMERIC_INPUT.fullmatch(text))
+            ) and len(text) <= 4096:
                 try:
-                    number = Decimal(literal.name)
+                    number = Decimal(text.replace("_", ""))
                 except InvalidOperation:
                     return None
                 if not number.is_finite():
@@ -500,9 +520,8 @@ class DorisGenerator(MySQLGenerator):
                 if children and all(child is not None for child in children):
                     known = t.cast(list[tuple[int, int | None]], children)
                     scales = {scale for _, scale in known if scale is not None}
-                    # PG retains per-element NUMERIC display scales. A fixed
-                    # Decimal array must not silently add observable trailing zeros.
-                    if len(scales) <= 1:
+                    # Only an explicit array CAST makes different input scales uniform.
+                    if fixed or len(scales) <= 1:
                         return max(width for width, _ in known), next(iter(scales), None)
             elif (number := number_input(value)) is not None:
                 return number[1], number[2]
@@ -523,9 +542,20 @@ class DorisGenerator(MySQLGenerator):
             return None
 
         resolved = bounds(expression)
+        if fixed and not resolved:
+            return self.func("ARRAY", *expression.expressions)
         integers, scale = resolved or (77, 0)
         scale = scale or 0
         precision = max(integers + scale, 1)
+        if fixed:
+            parameters = leaf_type.expressions
+            if 1 <= len(parameters) <= 2 and all(param.this.is_int for param in parameters):
+                precision = int(parameters[0].this.to_py())
+                scale = int(parameters[1].this.to_py()) if len(parameters) == 2 else 0
+                if not (resolved and 0 <= scale <= precision <= 76 and precision > 0):
+                    precision = 77
+            else:
+                precision = 77
         if precision > 76:
             self.unsupported("Doris cannot preserve this PostgreSQL NUMERIC array domain")
             return self.func("ARRAY", *expression.expressions)
