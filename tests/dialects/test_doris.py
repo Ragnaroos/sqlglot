@@ -48,6 +48,51 @@ class TestDoris(Validator):
                     )
         self.validate_identity("SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x) FROM t")
 
+    def test_percentile_disc_array(self):
+        source = "SELECT PERCENTILE_DISC(ARRAY[0.5, NULL]) WITHIN GROUP (ORDER BY x) AS xs FROM t"
+        expected = (
+            "SELECT IF(COUNT(x) = 0, NULL, ARRAY("
+            "IF(CAST(0.5 AS DOUBLE) IS NULL, NULL, ARRAY_SORT(COLLECT_LIST(x))"
+            "[GREATEST(1, CAST(CEIL(COALESCE(CAST(0.5 AS DOUBLE), 0) * COUNT(x)) AS BIGINT))]), "
+            "IF(CAST(NULL AS DOUBLE) IS NULL, NULL, ARRAY_SORT(COLLECT_LIST(x))"
+            "[GREATEST(1, CAST(CEIL(COALESCE(CAST(NULL AS DOUBLE), 0) * COUNT(x)) AS BIGINT))]))) AS xs FROM t"
+        )
+        self.validate_all(expected, read={"postgres": source})
+        self.validate_identity(expected)
+        for probabilities in ("ARRAY[0, 0.07, 1]", "ARRAY[[NULL, 1], [0.5, NULL]]"):
+            for key in ("x", "CAST(x AS BIGINT)", "CAST(x AS TEXT)", 't."X" DESC'):
+                tree = parse_one(
+                    f"SELECT PERCENTILE_DISC({probabilities}) WITHIN GROUP (ORDER BY {key}) AS xs FROM t",
+                    read="postgres",
+                )
+                before = tree.copy()
+                result = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree, before)
+                self.assertNotIn("WITHIN GROUP", result)
+                self.assertNotIn("ARRAY_MAP", result)
+                self.assertNotIn("PERCENTILE(", result)
+                if "DESC" in key:
+                    self.assertIn("ARRAY_REVERSE_SORT", result)
+                self.validate_identity(result)
+
+    def test_percentile_disc_array_exclusions(self):
+        for argument, key, suffix in (
+            ("ARRAY[p]", "x", ""),
+            ("ARRAY[-0.1]", "x", ""),
+            ("ARRAY[1.1]", "x", ""),
+            ("ARRAY[0.5]", "RANDOM()", ""),
+            ("ARRAY[0.5]", 'x COLLATE "C"', ""),
+            ("ARRAY[0.5]", "x", "FILTER(WHERE p)"),
+            ("ARRAY[0.5]", "x", "OVER()"),
+        ):
+            with self.subTest(argument=argument, key=key, suffix=suffix):
+                tree = parse_one(
+                    f"SELECT PERCENTILE_DISC({argument}) WITHIN GROUP (ORDER BY {key}) {suffix} FROM t",
+                    read="postgres",
+                )
+                with self.assertRaises(UnsupportedError):
+                    tree.sql("doris", unsupported_level=ErrorLevel.RAISE)
+
     def test_regr_count(self):
         for source, expected in (
             (
