@@ -1506,6 +1506,72 @@ def arrow_json_extract_sql(
     return self.binary(expression, op)
 
 
+def parse_postgres_array_literal(value: str) -> exp.Array | None:
+    """Parse one-dimensional PostgreSQL array input without assuming an element type."""
+    whitespace = " \t\r\n\v\f"
+    value = value.strip(whitespace)
+    if not value.startswith("{") or not value.endswith("}"):
+        return None
+    end = len(value) - 1
+    i = 1
+    elements = []
+    while i < end and value[i] in whitespace:
+        i += 1
+    if i == end:
+        return exp.Array(expressions=[])
+
+    while i < end:
+        quoted = value[i] == '"'
+        escaped = False
+        chars: list[tuple[str, bool]] = []
+        if quoted:
+            i += 1
+        while i < end:
+            char = value[i]
+            if char == "\\":
+                i += 1
+                if i == end:
+                    return None
+                chars.append((value[i], True))
+                escaped = True
+            elif quoted and char == '"':
+                i += 1
+                break
+            elif not quoted and char == ",":
+                break
+            elif not quoted and char in '{}"':
+                return None
+            else:
+                chars.append((char, False))
+            i += 1
+        else:
+            if quoted:
+                return None
+
+        if not quoted:
+            while chars and chars[-1][0] in whitespace and not chars[-1][1]:
+                chars.pop()
+            if not chars:
+                return None
+        text = "".join(char for char, _ in chars)
+        # Unquoted, unescaped NULL is part of PostgreSQL's array input grammar.
+        elements.append(
+            exp.null()
+            if not quoted and not escaped and text.upper() == "NULL"
+            else exp.Literal.string(text)
+        )
+        while i < end and value[i] in whitespace:
+            i += 1
+        if i == end:
+            return exp.Array(expressions=elements)
+        if value[i] != ",":
+            return None
+        i += 1
+        while i < end and value[i] in whitespace:
+            i += 1
+    return None
+
+
 def inline_array_sql(self: Generator, expression: exp.Expr) -> str:
     return f"[{self.expressions(expression, dynamic=True, new_line=True, skip_first=True, skip_last=True)}]"
 

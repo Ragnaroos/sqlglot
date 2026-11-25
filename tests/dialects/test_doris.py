@@ -896,19 +896,113 @@ class TestDoris(Validator):
                 parse_one(source, read="postgres").sql("doris", unsupported_level=ErrorLevel.RAISE)
 
     def test_postgres_unknown_subarray_conversion(self):
-        for source in (
-            "ARRAY[ARRAY[1,2],'{3,4}']",
-            "ARRAY['{3,4}',ARRAY[1,2]]",
-            "ARRAY[ARRAY['a','b'],'{c,d}']",
-            "ARRAY[(SELECT ARRAY[1,2]),'{3,4}']",
-            "ARRAY[ARRAY[x::INT,y::INT],'{3,4}']",
+        for source, expected in (
+            (
+                "ARRAY[ARRAY[1,2],'{3,4}']",
+                "CAST(ARRAY(CAST(ARRAY(1, 2) AS ARRAY<INT>), "
+                "CAST(ARRAY(CAST('3' AS INT), CAST('4' AS INT)) AS ARRAY<INT>)) "
+                "AS ARRAY<ARRAY<INT>>)",
+            ),
+            (
+                "ARRAY['{3,4}',ARRAY[1,2]]",
+                "CAST(ARRAY(CAST(ARRAY(CAST('3' AS INT), CAST('4' AS INT)) AS ARRAY<INT>), "
+                "CAST(ARRAY(1, 2) AS ARRAY<INT>)) AS ARRAY<ARRAY<INT>>)",
+            ),
+            (
+                "ARRAY[ARRAY['a','b'],'{c,d}']",
+                "CAST(ARRAY(CAST(ARRAY('a', 'b') AS ARRAY<STRING>), "
+                "CAST(ARRAY('c', 'd') AS ARRAY<STRING>)) AS ARRAY<ARRAY<STRING>>)",
+            ),
+            (
+                "ARRAY[ARRAY[TRUE,FALSE],'{yes,NULL}']",
+                "CAST(ARRAY(CAST(ARRAY(TRUE, FALSE) AS ARRAY<BOOLEAN>), "
+                "CAST(ARRAY(CAST('true' AS BOOLEAN), NULL) AS ARRAY<BOOLEAN>)) "
+                "AS ARRAY<ARRAY<BOOLEAN>>)",
+            ),
         ):
             with self.subTest(source=source):
                 tree = parse_one(source, read="postgres")
                 before = tree.copy()
-                with self.assertRaisesRegex(UnsupportedError, "array input conversion"):
-                    tree.sql("doris", unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree.sql("doris", copy=False), expected)
                 self.assertEqual(tree, before)
+                self.validate_identity(expected)
+
+        for source in (
+            "ARRAY[(SELECT ARRAY[1,2]),'{3,4}']",
+            "ARRAY[ARRAY[x::INT,y::INT],'{3,4}']",
+            "ARRAY[ARRAY[2147483648,2],'{3,4}']",
+        ):
+            with self.subTest(source=source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree, before)
+                self.assertNotIn("{3,4}", target)
+                self.validate_identity(target)
+
+        for source in (
+            "ARRAY[ARRAY[1,2],'[0:1]={3,4}']",
+            "ARRAY[ARRAY[ARRAY[1,2]],'{{3,4}}']",
+            "ARRAY[ARRAY[1::REAL,2::REAL],'{3,4}']",
+            "ARRAY[ARRAY[1.20,2.00],'{3.40,5.60}']",
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(UnsupportedError, "Doris cannot preserve"):
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    )
+
+    def test_postgres_unknown_subarray_cast_context(self):
+        source = "ARRAY[ARRAY[1,2],'{01,02}']::TEXT[][]"
+        tree = parse_one(source, read="postgres")
+        before = tree.copy()
+        target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+        self.assertEqual(tree, before)
+        self.assertIn("ARRAY('01', '02')", target)
+        self.assertNotIn("CAST('01' AS INT)", target)
+        self.validate_identity(target)
+
+    def test_postgres_escaped_array_inputs(self):
+        for source, plain in (
+            ("ARRAY[1,E'0x10']", "ARRAY[1,'0x10']"),
+            ("ARRAY[TRUE,E'yes']", "ARRAY[TRUE,'yes']"),
+            ("ARRAY[1.25,E'2.00']", "ARRAY[1.25,'2.00']"),
+            ("ARRAY[1::REAL,E'0.1']", "ARRAY[1::REAL,'0.1']"),
+            (
+                "ARRAY[CAST(E'1.235' AS NUMERIC(6,2)),NULL::NUMERIC(6,2)]",
+                "ARRAY[CAST('1.235' AS NUMERIC(6,2)),NULL::NUMERIC(6,2)]",
+            ),
+        ):
+            with self.subTest(source=source):
+                tree = parse_one(source, read="postgres")
+                before = tree.copy()
+                target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+                self.assertEqual(tree, before)
+                self.assertEqual(
+                    target,
+                    parse_one(plain, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    ),
+                )
+
+        tree = parse_one(r"ARRAY[ARRAY['a','b'],E'{N\\ULL,NULL}']", read="postgres")
+        before = tree.copy()
+        target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+        self.assertEqual(tree, before)
+        self.assertIn("ARRAY('NULL', NULL)", target)
+        self.validate_identity(target)
+
+        source = r"""ARRAY[ARRAY['a','b'],E'{"a\\"b","c\\\\d"}']"""
+        tree = parse_one(source, read="postgres")
+        before = tree.copy()
+        target = tree.sql("doris", copy=False, unsupported_level=ErrorLevel.RAISE)
+        self.assertEqual(tree, before)
+        values = [
+            value.this
+            for value in parse_one(target, read="doris").find_all(exp.Literal)
+            if value.is_string
+        ]
+        self.assertEqual(values, ["a", "b", 'a"b', r"c\d"])
 
     def test_postgres_fixed_numeric_array_cast(self):
         for values, precision, scale, inputs in (

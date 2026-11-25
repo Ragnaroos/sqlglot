@@ -8,6 +8,7 @@ from sqlglot import exp
 from sqlglot.dialects.dialect import (
     approx_count_distinct_sql,
     no_filter_sql,
+    parse_postgres_array_literal,
     property_sql,
     rename_func,
     time_format,
@@ -486,6 +487,8 @@ class DorisGenerator(MySQLGenerator):
 
         def number_input(value: exp.Expr) -> tuple[str, int, int] | None:
             literal = value.this if isinstance(value, exp.Neg) else value
+            if isinstance(literal, exp.ByteString) and not literal.args.get("is_bytes"):
+                literal = exp.Literal.string(literal.this)
             text = literal.name.strip(" \t\n\r\f\v")
             if len(text) > 4096:
                 return None
@@ -615,6 +618,8 @@ class DorisGenerator(MySQLGenerator):
             if type(value) is not exp.Cast or not value.to.is_type(exp.DType.DECIMAL):
                 return value.copy()
             inner = value.this.unnest()
+            if isinstance(inner, exp.ByteString) and not inner.args.get("is_bytes"):
+                inner = exp.Literal.string(inner.this)
             if inner.is_number or inner.is_string:
                 number = number_input(inner)
                 if number is None:
@@ -670,6 +675,19 @@ class DorisGenerator(MySQLGenerator):
         literal = expression
         while isinstance(literal, exp.Paren):
             literal = literal.this
+        if isinstance(literal, exp.ByteString) and not literal.args.get("is_bytes"):
+            literal = exp.Literal.string(literal.this)
+        if dtype.is_type(exp.DType.ARRAY) and dtype.expressions[0].is_type(
+            exp.DType.SMALLINT,
+            exp.DType.INT,
+            exp.DType.BIGINT,
+            exp.DType.TEXT,
+            exp.DType.BOOLEAN,
+        ):
+            array = parse_postgres_array_literal(literal.to_py()) if literal.is_string else None
+            if array is not None:
+                array.set("element_type", dtype.expressions[0].copy())
+                return array
         if dtype.is_type(exp.DType.FLOAT, exp.DType.DOUBLE):
             if isinstance(literal, exp.Subquery):
                 query = literal.this
