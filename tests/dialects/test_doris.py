@@ -5,6 +5,78 @@ from tests.dialects.test_dialect import Validator
 class TestDoris(Validator):
     dialect = "doris"
 
+    def test_regr_count(self):
+        for source, expected in (
+            (
+                "SELECT REGR_COUNT(b, a) FROM aggtest",
+                "SELECT COUNT(IF(NOT b IS NULL AND NOT a IS NULL, 1, NULL)) FROM aggtest",
+            ),
+            (
+                "SELECT REGR_COUNT(CAST(y AS DOUBLE), CAST(x AS DOUBLE)) AS n FROM t",
+                "SELECT COUNT(IF(NOT CAST(y AS DOUBLE) IS NULL AND NOT CAST(x AS DOUBLE) IS NULL, 1, NULL)) AS n FROM t",
+            ),
+            (
+                "SELECT REGR_COUNT(NULL, -1.5) AS n",
+                "SELECT COUNT(IF(NOT NULL IS NULL AND NOT -1.5 IS NULL, 1, NULL)) AS n",
+            ),
+            (
+                "SELECT REGR_COUNT(NULL, NULL) AS n",
+                "SELECT COUNT(IF(NOT NULL IS NULL AND NOT NULL IS NULL, 1, NULL)) AS n",
+            ),
+            (
+                "SELECT REGR_COUNT(CAST(NULL AS DOUBLE), 1) AS n",
+                "SELECT COUNT(IF(NOT CAST(NULL AS DOUBLE) IS NULL AND NOT 1 IS NULL, 1, NULL)) AS n",
+            ),
+            (
+                'SELECT REGR_COUNT(t."Y", t."X") AS "Pair Count" FROM t',
+                "SELECT COUNT(IF(NOT t.`Y` IS NULL AND NOT t.`X` IS NULL, 1, NULL)) AS `Pair Count` FROM t",
+            ),
+            (
+                "SELECT g, REGR_COUNT(y, x) AS n FROM t GROUP BY g HAVING REGR_COUNT(y, x) > 0 ORDER BY g",
+                "SELECT g, COUNT(IF(NOT y IS NULL AND NOT x IS NULL, 1, NULL)) AS n FROM t GROUP BY g HAVING COUNT(IF(NOT y IS NULL AND NOT x IS NULL, 1, NULL)) > 0 ORDER BY g NULLS LAST",
+            ),
+            (
+                "SELECT (SELECT REGR_COUNT(y, x) FROM t) AS n",
+                "SELECT (SELECT COUNT(IF(NOT y IS NULL AND NOT x IS NULL, 1, NULL)) FROM t) AS n",
+            ),
+            (
+                "SELECT SUM(n) OVER () FROM (SELECT REGR_COUNT(y, x) AS n FROM t) AS c",
+                "SELECT SUM(n) OVER () FROM (SELECT COUNT(IF(NOT y IS NULL AND NOT x IS NULL, 1, NULL)) AS n FROM t) AS c",
+            ),
+        ):
+            with self.subTest(source):
+                tree = parse_one(source, read="postgres")
+                original = tree.copy()
+                self.assertEqual(tree.sql("doris", copy=False), expected)
+                self.assertEqual(tree, original)
+                self.validate_all(expected, read={"postgres": source})
+                self.validate_identity(expected)
+
+    def test_regr_count_exclusions(self):
+        for source in (
+            "SELECT REGR_COUNT(y, x) OVER () FROM t",
+            "SELECT REGR_COUNT(y, x) FILTER(WHERE p) FROM t",
+            "SELECT REGR_COUNT(DISTINCT y, x) FROM t",
+            "SELECT REGR_COUNT(y, x ORDER BY z) FROM t",
+            "SELECT REGR_COUNT(y) FROM t",
+            "SELECT REGR_COUNT(RANDOM(), x) FROM t",
+            "SELECT REGR_COUNT(y + 1, x) FROM t",
+            "SELECT REGR_COUNT('1', x) FROM t",
+            "SELECT REGR_COUNT(CAST('bad' AS DOUBLE), x) FROM t",
+            "SELECT REGR_COUNT(CAST(y AS TEXT), x) FROM t",
+            "SELECT REGR_COUNT($1, x) FROM t",
+        ):
+            with self.subTest(source):
+                with self.assertRaises(UnsupportedError):
+                    parse_one(source, read="postgres").sql(
+                        "doris", unsupported_level=ErrorLevel.RAISE
+                    )
+
+        self.validate_all(
+            "SELECT REGR_COUNT(y, x) FROM t",
+            write={"postgres": "SELECT REGR_COUNT(y, x) FROM t"},
+        )
+
     def test_integer_generate_series(self):
         for source, expected in (
             (
